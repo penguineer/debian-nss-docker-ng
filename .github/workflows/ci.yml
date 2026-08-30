@@ -1,0 +1,127 @@
+---
+name: Debian Package CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build, check, install and smoke-test on Debian Trixie
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker BuildKit
+        uses: docker/setup-buildx-action@v3
+
+      # ------------------------------------------------------------------ #
+      # 1. Build the shared Trixie CI image once.                          #
+      #    All subsequent containers use this image so tools are           #
+      #    installed only once.  The image contains only build/test tools; #
+      #    no source, no .deb, no Cargo output is cached here.            #
+      #                                                                    #
+      #    APT_WEEK (YYYY-Www) is passed as a build argument.  It changes  #
+      #    every Monday, so the apt-get layer is rebuilt weekly to pick up #
+      #    current Trixie package versions.  Layers above the apt install  #
+      #    (base-image pull, etc.) are still reused within the same week.  #
+      # ------------------------------------------------------------------ #
+      - name: Compute APT_WEEK for CI image cache
+        run: echo "APT_WEEK=$(date -u +%G-W%V)" >> "$GITHUB_ENV"
+
+      - name: Build Trixie CI image
+        uses: docker/build-push-action@v6
+        with:
+          context: ci
+          file: ci/Dockerfile
+          push: false
+          load: true
+          tags: trixie-ci:latest
+          build-args: APT_WEEK=${{ env.APT_WEEK }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ------------------------------------------------------------------ #
+      # 2. Build the Debian package.                                       #
+      #    dpkg-buildpackage writes artefacts one level above the source   #
+      #    tree.  Mounting the parent directory makes them accessible to   #
+      #    later steps on the runner filesystem.                           #
+      # ------------------------------------------------------------------ #
+      - name: Build Debian package (Debian Trixie)
+        run: |
+          PARENT=$(dirname "${{ github.workspace }}")
+          SRCDIR=$(basename "${{ github.workspace }}")
+          docker run --rm \
+            --volume "$PARENT":/build \
+            --workdir "/build/$SRCDIR" \
+            trixie-ci:latest \
+            bash "ci/build-package.sh"
+
+      # ------------------------------------------------------------------ #
+      # 3. Lintian + package-contents checks                               #
+      # ------------------------------------------------------------------ #
+      - name: Check package (lintian + contents)
+        run: |
+          ARTIFACTS=$(dirname "${{ github.workspace }}")
+          docker run --rm \
+            --volume "$ARTIFACTS":/artifacts \
+            --volume "${{ github.workspace }}/ci":/ci:ro \
+            trixie-ci:latest \
+            bash /ci/check-package.sh /artifacts
+
+      # ------------------------------------------------------------------ #
+      # 4. Install / removal lifecycle test                                 #
+      # ------------------------------------------------------------------ #
+      - name: NSS lifecycle test (install + remove)
+        run: |
+          ARTIFACTS=$(dirname "${{ github.workspace }}")
+          docker run --rm \
+            --volume "$ARTIFACTS":/artifacts \
+            --volume "${{ github.workspace }}/ci":/ci:ro \
+            trixie-ci:latest \
+            bash /ci/test-lifecycle.sh /artifacts
+
+      # ------------------------------------------------------------------ #
+      # 5. End-to-end Docker / NSS smoke test                              #
+      # ------------------------------------------------------------------ #
+      - name: Docker NSS smoke test
+        run: |
+          ARTIFACTS=$(dirname "${{ github.workspace }}")
+
+          # Unique name avoids collisions between concurrent CI runs.
+          TEST_NAME="nss-test-${{ github.run_id }}-${{ github.run_attempt }}"
+
+          # Register cleanup before starting the container so it always runs.
+          cleanup() {
+            echo "=== Cleaning up test container ==="
+            docker rm -f "$TEST_NAME" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          echo "=== Starting test container: $TEST_NAME ==="
+          docker run -d --name "$TEST_NAME" alpine sleep 300
+
+          CONTAINER_IP=$(docker inspect \
+            -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
+            "$TEST_NAME")
+          echo "Container IP: $CONTAINER_IP"
+
+          echo ""
+          echo "=== Running NSS smoke test in Debian Trixie ==="
+
+          # Mount the host Docker socket so the NSS module can reach the
+          # daemon.  --privileged is NOT used.
+          docker run --rm \
+            --volume /var/run/docker.sock:/var/run/docker.sock \
+            --volume "$ARTIFACTS":/artifacts \
+            --volume "${{ github.workspace }}/ci":/ci:ro \
+            trixie-ci:latest \
+            bash /ci/smoke-test-nss.sh /artifacts "$TEST_NAME" "$CONTAINER_IP"
+
