@@ -1,7 +1,8 @@
 #!/bin/bash
 # ci/build-package.sh — Build the Debian package using dpkg-buildpackage.
 #
-# Expected environment: Debian Trixie with build dependencies installed.
+# Expected environment: Debian Trixie CI image (ci/Dockerfile) with all
+# build dependencies pre-installed.
 # Run from the root of the source tree.
 #
 # The package build exercises debian/rules, which calls:
@@ -10,13 +11,6 @@
 set -euo pipefail
 
 echo "=== Trixie toolchain ==="
-apt-get update -qq
-apt-get install -y --no-install-recommends \
-    build-essential \
-    dpkg-dev devscripts debhelper dh-nss \
-    cargo rustc \
-    binutils file
-
 rustc --version
 cargo --version
 

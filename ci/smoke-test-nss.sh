@@ -7,16 +7,13 @@
 #   <expected-ip>     IP address reported by the host Docker daemon for
 #                     the test container.
 #
-# Expected environment: Debian Trixie with /var/run/docker.sock accessible.
+# Expected environment: Debian Trixie CI image (ci/Dockerfile).
 # The Docker socket must be mounted in from the host runner.
 set -euo pipefail
 
 ARTIFACTS_DIR="${1:?Usage: $0 <artifacts-dir> <container-name> <expected-ip>}"
 TEST_NAME="${2:?Usage: $0 <artifacts-dir> <container-name> <expected-ip>}"
 EXPECTED_IP="${3:?Usage: $0 <artifacts-dir> <container-name> <expected-ip>}"
-
-apt-get update -qq
-apt-get install -y --no-install-recommends libc-bin
 
 DEB=$(ls "$ARTIFACTS_DIR"/libnss-docker-ng_*.deb | head -1)
 

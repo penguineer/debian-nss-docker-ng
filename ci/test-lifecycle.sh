@@ -4,13 +4,10 @@
 # Usage: test-lifecycle.sh <artifacts-dir>
 #   <artifacts-dir>  Directory containing the built .deb file.
 #
-# Expected environment: Debian Trixie with libc-bin installed.
+# Expected environment: Debian Trixie CI image (ci/Dockerfile).
 set -euo pipefail
 
 ARTIFACTS_DIR="${1:?Usage: $0 <artifacts-dir>}"
-
-apt-get update -qq
-apt-get install -y --no-install-recommends libc-bin binutils
 
 MULTIARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
 DEB=$(ls "$ARTIFACTS_DIR"/libnss-docker-ng_*.deb | head -1)

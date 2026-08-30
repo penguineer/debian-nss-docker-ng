@@ -19,11 +19,31 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Set up Docker BuildKit
+        uses: docker/setup-buildx-action@v3
+
       # ------------------------------------------------------------------ #
-      # 1. Build the Debian package in a clean Trixie container.           #
+      # 1. Build the shared Trixie CI image once.                          #
+      #    All subsequent containers use this image so tools are           #
+      #    installed only once.  The image contains only build/test tools; #
+      #    no source, no .deb, no Cargo output is cached here.            #
+      # ------------------------------------------------------------------ #
+      - name: Build Trixie CI image
+        uses: docker/build-push-action@v6
+        with:
+          context: ci
+          file: ci/Dockerfile
+          push: false
+          load: true
+          tags: trixie-ci:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ------------------------------------------------------------------ #
+      # 2. Build the Debian package.                                       #
       #    dpkg-buildpackage writes artefacts one level above the source   #
-      #    tree.  We mount the workspace parent so those files land on the  #
-      #    runner filesystem and are accessible to later steps.            #
+      #    tree.  Mounting the parent directory makes them accessible to   #
+      #    later steps on the runner filesystem.                           #
       # ------------------------------------------------------------------ #
       - name: Build Debian package (Debian Trixie)
         run: |
@@ -32,11 +52,11 @@ jobs:
           docker run --rm \
             --volume "$PARENT":/build \
             --workdir "/build/$SRCDIR" \
-            debian:trixie \
+            trixie-ci:latest \
             bash "ci/build-package.sh"
 
       # ------------------------------------------------------------------ #
-      # 2. Lintian + package-contents checks                               #
+      # 3. Lintian + package-contents checks                               #
       # ------------------------------------------------------------------ #
       - name: Check package (lintian + contents)
         run: |
@@ -44,11 +64,11 @@ jobs:
           docker run --rm \
             --volume "$ARTIFACTS":/artifacts \
             --volume "${{ github.workspace }}/ci":/ci:ro \
-            debian:trixie \
+            trixie-ci:latest \
             bash /ci/check-package.sh /artifacts
 
       # ------------------------------------------------------------------ #
-      # 3. Install / removal lifecycle test                                 #
+      # 4. Install / removal lifecycle test                                 #
       # ------------------------------------------------------------------ #
       - name: NSS lifecycle test (install + remove)
         run: |
@@ -56,11 +76,11 @@ jobs:
           docker run --rm \
             --volume "$ARTIFACTS":/artifacts \
             --volume "${{ github.workspace }}/ci":/ci:ro \
-            debian:trixie \
+            trixie-ci:latest \
             bash /ci/test-lifecycle.sh /artifacts
 
       # ------------------------------------------------------------------ #
-      # 4. End-to-end Docker / NSS smoke test                              #
+      # 5. End-to-end Docker / NSS smoke test                              #
       # ------------------------------------------------------------------ #
       - name: Docker NSS smoke test
         run: |
@@ -93,6 +113,6 @@ jobs:
             --volume /var/run/docker.sock:/var/run/docker.sock \
             --volume "$ARTIFACTS":/artifacts \
             --volume "${{ github.workspace }}/ci":/ci:ro \
-            debian:trixie \
+            trixie-ci:latest \
             bash /ci/smoke-test-nss.sh /artifacts "$TEST_NAME" "$CONTAINER_IP"
 
