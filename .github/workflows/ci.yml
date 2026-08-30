@@ -1,0 +1,283 @@
+---
+name: Debian Package CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build, check, install and smoke-test on Debian Trixie
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------ #
+      # 1. Build the Debian source package in a clean Trixie container.    #
+      # The container is used only for the build; artefacts land in the    #
+      # runner workspace so later steps can access them directly.          #
+      # ------------------------------------------------------------------ #
+      - name: Build Debian package (Debian Trixie)
+        run: |
+          # Copy source into a bind-mounted directory so the container sees it.
+          # We run as root inside the container so dpkg-buildpackage has no
+          # privilege problems, but Rules-Requires-Root: no is honoured.
+          docker run --rm \
+            --volume "${{ github.workspace }}:/src" \
+            --workdir /src \
+            debian:trixie \
+            bash -euo pipefail -c '
+              echo "=== Trixie toolchain ==="
+              apt-get update -qq
+              apt-get install -y --no-install-recommends \
+                dpkg-dev devscripts debhelper dh-nss lintian \
+                cargo rustc \
+                binutils file 2>&1 | tail -5
+
+              rustc --version
+              cargo --version
+
+              echo ""
+              echo "=== Building package ==="
+              dpkg-buildpackage -us -uc -b
+            '
+
+      # ------------------------------------------------------------------ #
+      # 2. Lintian                                                         #
+      # ------------------------------------------------------------------ #
+      - name: Run lintian
+        run: |
+          docker run --rm \
+            --volume "${{ github.workspace }}/..":/work \
+            --workdir /work \
+            debian:trixie \
+            bash -euo pipefail -c '
+              apt-get update -qq
+              apt-get install -y --no-install-recommends lintian 2>&1 | tail -3
+
+              echo "=== Lintian ==="
+              # Accepted findings are narrowly suppressed and documented:
+              #   extended-description-is-empty: upstream summary is intentionally
+              #     brief; not a packaging defect.
+              # *.dsc is intentionally omitted: the build is binary-only (-b) and
+              # produces no source package.
+              LINTIAN_OUT=$(lintian \
+                --suppress-tags extended-description-is-empty \
+                *.deb *.changes 2>&1 || true)
+              echo "$LINTIAN_OUT"
+
+              # Fail on errors (E:) even if we tolerate warnings.
+              if echo "$LINTIAN_OUT" | grep -q "^E:"; then
+                echo "lintian found error-level findings — failing."
+                exit 1
+              fi
+              echo "No lintian errors."
+            '
+
+      # ------------------------------------------------------------------ #
+      # 3. Inspect package contents                                        #
+      # ------------------------------------------------------------------ #
+      - name: Inspect package contents
+        run: |
+          DEB=$(ls "${{ github.workspace }}"/../libnss-docker-ng_*.deb 2>/dev/null | head -1)
+          echo "Inspecting: $DEB"
+
+          docker run --rm \
+            --volume "$(dirname "$DEB")":/work \
+            --workdir /work \
+            debian:trixie \
+            bash -euo pipefail -c "
+              apt-get update -qq
+              apt-get install -y --no-install-recommends binutils file 2>&1 | tail -3
+
+              DEB=\$(ls libnss-docker-ng_*.deb | head -1)
+              echo \"=== dpkg-deb --contents \$DEB ===\"
+              dpkg-deb --contents \"\$DEB\"
+
+              MULTIARCH=\$(dpkg-architecture -qDEB_HOST_MULTIARCH)
+              echo \"\"
+              echo \"=== Verifying expected library paths (multiarch=\$MULTIARCH) ===\"
+
+              dpkg-deb --contents \"\$DEB\" | grep \"\$MULTIARCH\" | grep 'libnss_docker_ng'
+
+              # Must contain both the .so (symlink) and .so.2 (soname library).
+              dpkg-deb --contents \"\$DEB\" | grep -q \"usr/lib/\${MULTIARCH}/libnss_docker_ng.so\$\" \
+                || { echo 'FAIL: libnss_docker_ng.so not found in expected multiarch path'; exit 1; }
+              dpkg-deb --contents \"\$DEB\" | grep -q \"usr/lib/\${MULTIARCH}/libnss_docker_ng.so.2\" \
+                || { echo 'FAIL: libnss_docker_ng.so.2 not found in expected multiarch path'; exit 1; }
+
+              echo 'Package contents check PASSED.'
+            "
+
+      # ------------------------------------------------------------------ #
+      # 4. Installation / NSS lifecycle test                               #
+      # ------------------------------------------------------------------ #
+      - name: Install package and verify NSS lifecycle
+        run: |
+          DEB=$(ls "${{ github.workspace }}"/../libnss-docker-ng_*.deb 2>/dev/null | head -1)
+
+          docker run --rm \
+            --volume "$(dirname "$DEB")":/debs \
+            debian:trixie \
+            bash -euo pipefail -c "
+              apt-get update -qq
+              apt-get install -y --no-install-recommends libc-bin 2>&1 | tail -3
+
+              MULTIARCH=\$(dpkg-architecture -qDEB_HOST_MULTIARCH)
+              DEB=\$(ls /debs/libnss-docker-ng_*.deb | head -1)
+
+              echo \"=== Pre-install nsswitch.conf ===\"
+              PRE_NSS=\$(grep '^hosts:' /etc/nsswitch.conf || true)
+              echo \"\$PRE_NSS\"
+
+              echo \"\"
+              echo \"=== Installing \$DEB ===\"
+              dpkg -i \"\$DEB\"
+
+              echo \"\"
+              echo \"=== Post-install nsswitch.conf ===\"
+              POST_NSS=\$(grep '^hosts:' /etc/nsswitch.conf || true)
+              echo \"\$POST_NSS\"
+
+              echo \"\"
+              echo \"=== Verifying library is in multiarch path ===\"
+              ls -la \"/usr/lib/\${MULTIARCH}/libnss_docker_ng.so\"  || { echo 'FAIL: .so missing'; exit 1; }
+              ls -la \"/usr/lib/\${MULTIARCH}/libnss_docker_ng.so.2\" || { echo 'FAIL: .so.2 missing'; exit 1; }
+
+              echo \"\"
+              echo \"=== Verifying NSS entry points in .so.2 ===\"
+              nm -D \"/usr/lib/\${MULTIARCH}/libnss_docker_ng.so.2\" | grep -E '_nss_docker_ng_(gethostbyname[24]?_r|gethostbyaddr_r)'
+
+              echo \"\"
+              echo \"=== Verifying library is loadable ===\"
+              ldconfig
+              ldconfig -p | grep libnss_docker_ng || { echo 'FAIL: library not in ldconfig cache'; exit 1; }
+
+              echo \"\"
+              echo \"=== Verifying dh_installnss added docker_ng to hosts: ===\"
+              grep '^hosts:' /etc/nsswitch.conf | grep -q 'docker_ng' \
+                || { echo 'FAIL: docker_ng not in hosts: line after install'; exit 1; }
+              echo 'Install verification PASSED.'
+
+              echo \"\"
+              echo \"=== Removing package ===\"
+              dpkg -r libnss-docker-ng
+
+              echo \"\"
+              echo \"=== Post-removal nsswitch.conf ===\"
+              POST_REMOVE_NSS=\$(grep '^hosts:' /etc/nsswitch.conf || true)
+              echo \"\$POST_REMOVE_NSS\"
+
+              echo \"\"
+              echo \"=== Verifying libraries are removed ===\"
+              test ! -f \"/usr/lib/\${MULTIARCH}/libnss_docker_ng.so\"  || { echo 'FAIL: .so still present after removal'; exit 1; }
+              test ! -f \"/usr/lib/\${MULTIARCH}/libnss_docker_ng.so.2\" || { echo 'FAIL: .so.2 still present after removal'; exit 1; }
+
+              echo \"\"
+              echo \"=== Verifying docker_ng removed from NSS config ===\"
+              grep '^hosts:' /etc/nsswitch.conf | grep -qv 'docker_ng' \
+                || { echo 'FAIL: docker_ng still in hosts: line after removal'; exit 1; }
+              echo 'Removal verification PASSED.'
+
+              echo \"\"
+              echo \"=== Verifying NSS hosts: line restored to pre-install state ===\"
+              CURRENT_NSS=\$(grep '^hosts:' /etc/nsswitch.conf || true)
+              if [ \"\$PRE_NSS\" = \"\$CURRENT_NSS\" ]; then
+                echo 'NSS configuration restored correctly.'
+              else
+                echo \"WARNING: NSS line changed: was [\$PRE_NSS], now [\$CURRENT_NSS]\"
+                # Not a hard failure — removal semantics may reorder tokens.
+              fi
+            "
+
+      # ------------------------------------------------------------------ #
+      # 5. End-to-end Docker / NSS smoke test                              #
+      # ------------------------------------------------------------------ #
+      - name: Docker NSS smoke test
+        run: |
+          DEB=$(ls "${{ github.workspace }}"/../libnss-docker-ng_*.deb 2>/dev/null | head -1)
+          DEBDIR=$(dirname "$DEB")
+
+          # Choose a unique container name to avoid collisions between
+          # concurrent CI runs on the same runner.
+          TEST_NAME="nss-test-${{ github.run_id }}-${{ github.run_attempt }}"
+
+          # Ensure cleanup even on failure.
+          cleanup() {
+            echo "=== Cleaning up test container ==="
+            docker rm -f "$TEST_NAME" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          # Start a long-lived test container with the known name on the
+          # host Docker daemon; use a minimal image.
+          echo "=== Starting test container: $TEST_NAME ==="
+          docker run -d --name "$TEST_NAME" alpine sleep 300
+
+          # Obtain the Docker-reported IP for the container.
+          CONTAINER_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$TEST_NAME")
+          echo "Container IP: $CONTAINER_IP"
+
+          echo ""
+          echo "=== Running NSS smoke test in Debian Trixie ==="
+
+          # Mount the host Docker socket and the built .deb into the
+          # Trixie container.  --privileged is NOT used.
+          docker run --rm \
+            --volume /var/run/docker.sock:/var/run/docker.sock \
+            --volume "$DEBDIR":/debs \
+            --env TEST_NAME="$TEST_NAME" \
+            --env EXPECTED_IP="$CONTAINER_IP" \
+            debian:trixie \
+            bash -euo pipefail -c '
+              apt-get update -qq
+              apt-get install -y --no-install-recommends \
+                libc-bin iproute2 2>&1 | tail -3
+
+              DEB=$(ls /debs/libnss-docker-ng_*.deb | head -1)
+              echo "Installing: $DEB"
+              dpkg -i "$DEB"
+              ldconfig
+
+              echo ""
+              echo "=== nsswitch.conf hosts: line ==="
+              grep "^hosts:" /etc/nsswitch.conf
+
+              echo ""
+              echo "=== getent hosts ${TEST_NAME}.docker ==="
+              RESOLVED=$(getent hosts "${TEST_NAME}.docker" || true)
+              echo "Result: $RESOLVED"
+
+              if [ -z "$RESOLVED" ]; then
+                echo "FAIL: getent returned nothing for ${TEST_NAME}.docker"
+                exit 1
+              fi
+
+              RESOLVED_IP=$(echo "$RESOLVED" | awk '"'"'{print $1}'"'"')
+              if [ "$RESOLVED_IP" = "$EXPECTED_IP" ]; then
+                echo "PASS: resolved $RESOLVED_IP matches expected $EXPECTED_IP"
+              else
+                echo "FAIL: resolved $RESOLVED_IP but expected $EXPECTED_IP"
+                exit 1
+              fi
+
+              echo ""
+              echo "=== Removing package and verifying NSS is restored ==="
+              PRE_REMOVE=$(grep "^hosts:" /etc/nsswitch.conf || true)
+              dpkg -r libnss-docker-ng
+              POST_REMOVE=$(grep "^hosts:" /etc/nsswitch.conf || true)
+
+              echo "Before: $PRE_REMOVE"
+              echo "After:  $POST_REMOVE"
+
+              echo "$POST_REMOVE" | grep -qv "docker_ng" \
+                || { echo "FAIL: docker_ng still present in NSS config after removal"; exit 1; }
+              echo "PASS: docker_ng removed from NSS config."
+            '
