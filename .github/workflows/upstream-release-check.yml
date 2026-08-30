@@ -95,18 +95,38 @@ jobs:
             "https://crates.io/api/v1/crates/${CRATE_NAME}/versions") \
             || { echo "WARNING: crates.io API unavailable; skipping reconciliation" >&2; exit 0; }
 
+          # Automation ownership marker written into every PR body by the
+          # "Create pull request" step below.  Both the branch-name shape and
+          # the presence of this exact string must match before a PR is
+          # considered automation-owned.  This prevents inadvertently modifying
+          # manually-created maintainer PRs that happen to use the same branch
+          # naming convention.
+          AUTOMATION_MARKER="This PR was created automatically by the upstream-release-check workflow."
+
           # List open PRs whose branch name starts with upstream-update/
+          # Include body so we can verify the automation marker.
           OPEN_UPDATE_PRS=$(gh pr list \
             --state open \
-            --json number,title,headRefName,labels \
+            --json number,title,headRefName,labels,body \
             --jq '[.[] | select(.headRefName | startswith("upstream-update/"))]')
 
-          echo "$OPEN_UPDATE_PRS" | jq -r '.[] | "\(.number) \(.headRefName)"' | \
-          while IFS=' ' read -r PR_NUM BRANCH; do
+          # Emit one line per PR: "<number> <branch> <base64-body>" so that
+          # multi-line PR bodies survive the read loop without an extra API call.
+          echo "$OPEN_UPDATE_PRS" | jq -r '.[] | "\(.number) \(.headRefName) \(.body | @base64)"' | \
+          while IFS=' ' read -r PR_NUM BRANCH BODY_B64; do
+            # Decode the body from the bulk fetch (no extra API call needed)
+            PR_BODY=$(echo "$BODY_B64" | base64 --decode 2>/dev/null || true)
+
             # Extract version from branch name: upstream-update/X.Y.Z
             PR_VERSION="${BRANCH#upstream-update/}"
             if [ -z "$PR_VERSION" ]; then
               echo "PR #$PR_NUM: could not extract version from branch $BRANCH — skipping"
+              continue
+            fi
+
+            # Only act on automation-owned PRs (branch shape + marker in body)
+            if ! echo "$PR_BODY" | grep -qF "$AUTOMATION_MARKER"; then
+              echo "PR #$PR_NUM (${PR_VERSION}): automation marker absent — skipping (manually-created PR)"
               continue
             fi
 
@@ -143,7 +163,7 @@ jobs:
               fi
 
             elif [ "$YANKED" = "unknown" ]; then
-              echo "PR #$PR_NUM (${PR_VERSION}): version not found on crates.io — skipping (may be a manual branch)"
+              echo "PR #$PR_NUM (${PR_VERSION}): version not found on crates.io — skipping"
             else
               echo "PR #$PR_NUM (${PR_VERSION}): version still non-yanked — OK"
             fi
