@@ -1,0 +1,26 @@
+#!/usr/bin/make -f
+
+export DH_VERBOSE = 1
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+export CARGO_HOME = $(CURDIR)/.cargo-home
+export RUSTFLAGS = -C link-arg=-Wl,-soname,libnss_docker_ng.so.2
+
+%:
+	dh $@ --with installnss
+
+override_dh_auto_configure:
+	rm -rf vendor .cargo
+	tar zxf vendor.tar.gz
+
+override_dh_auto_build:
+	cargo build --release --locked --offline
+	ln -sf libnss_docker_ng.so target/release/libnss_docker_ng.so.2
+
+override_dh_auto_test:
+	cargo test --locked --offline
+
+override_dh_auto_install:
+	:
+
+override_dh_auto_clean:
+	rm -rf vendor .cargo .cargo-home target

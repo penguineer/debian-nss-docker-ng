@@ -1,0 +1,25 @@
+Source: nss-docker-ng
+Section: net
+Priority: optional
+Maintainer: Stefan Haun <tux@netz39.de>
+Build-Depends: debhelper-compat (= 13),
+               dh-nss,
+               cargo,
+               rustc (>= 1.85~)
+Standards-Version: 4.7.2
+Homepage: https://github.com/petski/nss-docker-ng
+Rules-Requires-Root: no
+
+Package: libnss-docker-ng
+Architecture: any
+Multi-Arch: same
+Pre-Depends: ${misc:Pre-Depends}
+Depends: ${misc:Depends}, ${shlibs:Depends}
+Conflicts: libnss-docker
+Replaces: libnss-docker
+Description: NSS module for resolving Docker container names
+ libnss-docker-ng is a Name Service Switch (NSS) plugin that resolves
+ Docker container hostnames via the .docker virtual domain.
+ .
+ When enabled in /etc/nsswitch.conf, container names become resolvable
+ as <container-name>.docker.

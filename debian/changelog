@@ -1,0 +1,6 @@
+nss-docker-ng (1.2.1-1) unstable; urgency=low
+
+  * Initial Debian package.
+  * Closes: #1119131
+
+ -- Stefan Haun <tux@netz39.de>  Sun, 30 Aug 2026 13:00:00 +0000
