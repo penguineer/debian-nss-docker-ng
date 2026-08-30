@@ -10,9 +10,9 @@ on:
       force_version:
         description: >
           Target a specific upstream version (for testing the updater without
-          waiting for a real release). The version is still validated through
-          the normal crates.io release-safety rules (stable, non-yanked,
-          correct semver form).
+          waiting for a real release). The version is validated through the
+          full crates.io release-safety rules (stable semver, non-yanked,
+          checksum present) via --target-version mode in check-upstream.sh.
         required: false
         default: ""
 
@@ -39,71 +39,35 @@ jobs:
       - name: Make scripts executable
         run: chmod +x ci/check-upstream.sh ci/prepare-update.sh ci/tests/test-check-upstream.sh
 
-      - name: Run unit tests for check-upstream
-        run: bash ci/tests/test-check-upstream.sh
+      - name: Run updater tests
+        # Install devscripts so the prepare-update integration tests are not skipped.
+        # The tests run in read-only mode: they use a fixture checkout and do not
+        # modify the repository or create any branch/PR.
+        run: |
+          sudo apt-get install -y devscripts
+          bash ci/tests/test-check-upstream.sh
 
       - name: Check crates.io for updates
         id: check
         run: |
           set -euo pipefail
-
-          # When force_version is set, pass it as the "current" version so that
-          # check-upstream.sh validates the forced version through the normal
-          # crates.io safety rules and outputs its metadata.
           FORCE="${{ github.event.inputs.force_version }}"
           if [ -n "$FORCE" ]; then
-            # Use a version guaranteed to be lower than any real release so the
-            # forced target always appears as an update.  The forced version
-            # itself is validated (stable, non-yanked, correct semver) by the
-            # same jq filter used for automatic discovery.
-            OUTPUT=$(bash ci/check-upstream.sh --current-version "0.0.0")
+            # --target-version validates the requested version through the same
+            # full safety rules as automatic discovery (stable semver, non-yanked,
+            # checksum present).  It is not a shortcut around release policy.
+            CURRENT_VER=$(head -1 debian/changelog | grep -oP '\(\K[^)]+' | sed 's/-[0-9]*$//')
+            OUTPUT=$(bash ci/check-upstream.sh \
+              --current-version "$CURRENT_VER" \
+              --target-version "$FORCE")
             echo "$OUTPUT"
-
-            # Extract the validated upstream metadata from the normal check
-            VALIDATED_VER=$(echo "$OUTPUT" | grep '^UPSTREAM_VERSION=' | cut -d= -f2)
-            if [ "$VALIDATED_VER" != "$FORCE" ]; then
-              # The forced version is not the newest; confirm it still exists
-              # and is non-yanked by querying crates.io directly for that version.
-              RESP=$(curl --silent --fail \
-                --max-time 30 \
-                --user-agent "debian-nss-docker-ng-updater/1 (https://github.com/penguineer/debian-nss-docker-ng)" \
-                "https://crates.io/api/v1/crates/nss-docker-ng/versions")
-              YANKED=$(echo "$RESP" | jq -r --arg v "$FORCE" \
-                '.versions | map(select(.num == $v)) | first | .yanked // "missing"')
-              if [ "$YANKED" != "false" ]; then
-                echo "ERROR: force_version=$FORCE is yanked or does not exist on crates.io (yanked=$YANKED)" >&2
-                exit 1
-              fi
-              CHECKSUM=$(echo "$RESP" | jq -r --arg v "$FORCE" \
-                '.versions | map(select(.num == $v)) | first | .checksum')
-              if [ -z "$CHECKSUM" ] || [ "$CHECKSUM" = "null" ]; then
-                echo "ERROR: No checksum for force_version=$FORCE" >&2
-                exit 1
-              fi
-              CRATE_URL="https://static.crates.io/crates/nss-docker-ng/${FORCE}/download"
-              CURRENT_VER=$(head -1 debian/changelog | grep -oP '\(\K[^)]+' | sed 's/-[0-9]*$//')
-              {
-                echo "update_available=true"
-                echo "current_version=${CURRENT_VER}"
-                echo "upstream_version=${FORCE}"
-                echo "crate_url=${CRATE_URL}"
-                echo "crate_checksum=${CHECKSUM}"
-              } >> "$GITHUB_OUTPUT"
-            else
-              # Forced version matches the validated newest — use normal output
-              while IFS='=' read -r key val; do
-                echo "${key}=${val}" >> "$GITHUB_OUTPUT"
-              done <<< "$OUTPUT"
-              # Ensure update_available is true for forced runs
-              echo "update_available=true" >> "$GITHUB_OUTPUT"
-            fi
           else
             OUTPUT=$(bash ci/check-upstream.sh)
             echo "$OUTPUT"
-            while IFS='=' read -r key val; do
-              echo "${key}=${val}" >> "$GITHUB_OUTPUT"
-            done <<< "$OUTPUT"
           fi
+          while IFS='=' read -r key val; do
+            echo "${key,,}=${val}" >> "$GITHUB_OUTPUT"
+          done <<< "$OUTPUT"
 
       - name: Log result
         run: |
@@ -174,7 +138,8 @@ jobs:
 
           git checkout -b "$BRANCH"
 
-          # Run the update logic; capture machine-readable flags from stdout
+          # The script operates on the current checkout (no --repo-root needed
+          # in production; --repo-root is used only by integration tests).
           PREPARE_OUTPUT=$(bash ci/prepare-update.sh \
             "$NEW_VER" \
             "${{ needs.check.outputs.crate_url }}" \

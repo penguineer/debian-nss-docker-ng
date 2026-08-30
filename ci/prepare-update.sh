@@ -2,7 +2,13 @@
 # ci/prepare-update.sh — Prepare a package update for a new upstream release.
 #
 # Usage:
-#   prepare-update.sh NEW_VERSION CRATE_URL CRATE_CHECKSUM
+#   prepare-update.sh [--repo-root DIR] NEW_VERSION CRATE_URL CRATE_CHECKSUM
+#
+# Options:
+#   --repo-root DIR   Operate on DIR instead of the default (the parent directory
+#                     of the ci/ directory where this script lives).  Used by
+#                     integration tests to direct the script at a fixture checkout
+#                     without modifying the real repository.
 #
 # Required environment (set by the calling workflow):
 #   DEBEMAIL    — maintainer email for dch
@@ -27,11 +33,42 @@
 # After this script completes, the repository tree is ready for a commit.
 set -euo pipefail
 
-NEW_VERSION="${1:?Usage: prepare-update.sh NEW_VERSION CRATE_URL CRATE_CHECKSUM}"
+# ── Parse arguments ───────────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT_OVERRIDE=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --repo-root)
+            REPO_ROOT_OVERRIDE="$(cd "$2" && pwd)"
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "ERROR: Unknown option: $1" >&2
+            exit 1
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+NEW_VERSION="${1:?Usage: prepare-update.sh [--repo-root DIR] NEW_VERSION CRATE_URL CRATE_CHECKSUM}"
 CRATE_URL="${2:?Missing CRATE_URL}"
 EXPECTED_CHECKSUM="${3:?Missing CRATE_CHECKSUM}"
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Default: parent of the ci/ directory where this script lives.
+# Tests override this with --repo-root to avoid touching the real checkout.
+if [ -n "$REPO_ROOT_OVERRIDE" ]; then
+    REPO_ROOT="$REPO_ROOT_OVERRIDE"
+else
+    REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
+
 WORK_DIR="$(mktemp -d /tmp/nss-docker-ng-update.XXXXXX)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
@@ -61,7 +98,6 @@ is_packaging_owned() {
     local p="$1"
     local owned
     for owned in "${PACKAGING_OWNED[@]}"; do
-        # Match exact path or path under directory
         if [ "$p" = "$owned" ] || [[ "$p" == "$owned/"* ]]; then
             return 0
         fi
@@ -93,24 +129,18 @@ info "Checksum OK: $ACTUAL_CHECKSUM"
 mkdir -p "$CRATE_EXTRACT"
 tar -xzf "$CRATE_ARCHIVE" -C "$CRATE_EXTRACT"
 
-# The crate extracts into a directory named <name>-<version>/
 UPSTREAM_DIR="${CRATE_EXTRACT}/${CRATE_NAME}-${NEW_VERSION}"
 [ -d "$UPSTREAM_DIR" ] || die "Expected directory $UPSTREAM_DIR not found in crate archive"
 
 [ -f "$UPSTREAM_DIR/Cargo.toml" ] || die "No Cargo.toml in upstream crate"
 [ -f "$UPSTREAM_DIR/Cargo.lock" ] || die "No Cargo.lock in upstream crate"
 
-# Save the previous Cargo.lock for the diff report
 OLD_CARGO_LOCK="${WORK_DIR}/Cargo.lock.old"
 cp "$REPO_ROOT/Cargo.lock" "$OLD_CARGO_LOCK"
 
-info "Synchronising upstream source files (preserving packaging-owned paths)"
+info "Synchronising upstream source files into $REPO_ROOT (preserving packaging-owned paths)"
 
-# Step 2a: copy every upstream file that is not packaging-owned into the repo.
-# Use find on the upstream dir so we get every file, including new ones added
-# by the new release.
 while IFS= read -r -d '' upstream_file; do
-    # Compute path relative to upstream dir
     rel="${upstream_file#$UPSTREAM_DIR/}"
     if is_packaging_owned "$rel"; then
         info "  skipping (packaging-owned): $rel"
@@ -121,13 +151,9 @@ while IFS= read -r -d '' upstream_file; do
     fi
 done < <(find "$UPSTREAM_DIR" -type f -print0)
 
-# Step 2b: remove any upstream-owned file from the repo that no longer exists
-# in the new upstream crate (deleted files).
 while IFS= read -r -d '' repo_file; do
     rel="${repo_file#$REPO_ROOT/}"
-    # Skip packaging-owned paths
     is_packaging_owned "$rel" && continue
-    # Skip .git/
     [[ "$rel" == ".git/"* ]] && continue
     upstream_counterpart="$UPSTREAM_DIR/$rel"
     if [ ! -f "$upstream_counterpart" ]; then
@@ -173,7 +199,6 @@ fi
 
 # ── 4. Regenerate vendor.tar.gz ───────────────────────────────────────────────
 
-# Apply the patch before vendoring (so the locked/patched lockfile is used)
 cd "$REPO_ROOT"
 if [ "$PATCH_STATUS" = "applied" ]; then
     info "Applying patch before vendoring"
@@ -185,22 +210,18 @@ VENDOR_DIR="${WORK_DIR}/vendor"
 CARGO_CONFIG_DIR="${WORK_DIR}/.cargo"
 mkdir -p "$VENDOR_DIR" "$CARGO_CONFIG_DIR"
 
-# cargo vendor prints the [source.crates-io] config block to stdout; capture it
 VENDOR_CONFIG=$(cargo vendor --locked "$VENDOR_DIR" 2>/dev/null \
     || cargo vendor "$VENDOR_DIR" 2>/dev/null \
     || die "cargo vendor failed")
 
-# Write the vendor configuration that Cargo needs for offline builds
 cat > "$CARGO_CONFIG_DIR/config.toml" <<EOF
 $VENDOR_CONFIG
 EOF
 
-# Revert patch so the repo tree stays unpatched (patch lives in debian/patches)
 if [ "$PATCH_STATUS" = "applied" ]; then
     patch -R -p1 < "$PATCH_FILE"
 fi
 
-# Remove any Cargo.lock inside vendor/ (must not shadow the repo lockfile)
 find "$VENDOR_DIR" -name "Cargo.lock" -delete
 
 info "Creating vendor.tar.gz (.cargo/config.toml + vendor/, no Cargo.lock)"
@@ -230,7 +251,7 @@ dch \
 # ── 6. Report changes ────────────────────────────────────────────────────────
 
 CARGO_TOML_CHANGED=false
-git diff --quiet HEAD -- Cargo.toml 2>/dev/null || CARGO_TOML_CHANGED=true
+git -C "$REPO_ROOT" diff --quiet HEAD -- Cargo.toml 2>/dev/null || CARGO_TOML_CHANGED=true
 
 CARGO_LOCK_CHANGED=false
 if ! diff -q "$OLD_CARGO_LOCK" "$REPO_ROOT/Cargo.lock" >/dev/null 2>&1; then
@@ -245,6 +266,7 @@ echo " Previous upstream: $OLD_UPSTREAM"
 echo " New upstream:      $NEW_VERSION"
 echo " Crate URL:         $CRATE_URL"
 echo " Checksum (sha256): $ACTUAL_CHECKSUM"
+echo " Repo root:         $REPO_ROOT"
 echo ""
 echo " Cargo.toml changed:      $CARGO_TOML_CHANGED"
 echo " Cargo.lock changed:      $CARGO_LOCK_CHANGED"
@@ -265,7 +287,6 @@ git diff --no-index --stat \
 echo "════════════════════════════════════════════════════════════"
 echo ""
 
-# Machine-readable flags consumed by the workflow
 DRAFT_PR=false
 if [ "$PATCH_STATUS" = "needs-review" ] || [ "$PATCH_STATUS" = "possibly-obsolete" ]; then
     DRAFT_PR=true
