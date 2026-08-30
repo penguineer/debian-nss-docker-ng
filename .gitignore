@@ -18,3 +18,8 @@ debian/files
 debian/libnss-docker-ng/
 debian/libnss-docker-ng.substvars
 debian/tmp/
+
+# Keep upstream test fixtures available for cargo test
+!tests/
+!tests/resources/
+!tests/resources/**
