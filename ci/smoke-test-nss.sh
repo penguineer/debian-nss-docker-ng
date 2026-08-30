@@ -35,8 +35,13 @@ grep '^hosts:' /etc/nsswitch.conf
 
 echo ""
 echo "=== getent hosts ${TEST_NAME}.docker ==="
-RESOLVED=$(getent hosts "${TEST_NAME}.docker")
+RESOLVED=$(getent hosts "${TEST_NAME}.docker" || true)
 echo "Result: $RESOLVED"
+
+if [ -z "$RESOLVED" ]; then
+    echo "FAIL: getent returned nothing for ${TEST_NAME}.docker"
+    exit 1
+fi
 
 RESOLVED_IP=$(echo "$RESOLVED" | awk '{print $1}')
 if [ "$RESOLVED_IP" = "$EXPECTED_IP" ]; then
