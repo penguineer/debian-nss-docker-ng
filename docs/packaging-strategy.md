@@ -144,25 +144,19 @@ for its Launchpad PPA builds.
 
 ### `dh-cargo`/`debcargo` and `cdylib`
 
-The Debian Rust Team book has a `cdylib` chapter, but explicitly notes that policy for
-`cdylib` crates is not yet fully specified. The general guidance is to use `dh-cargo`
-where possible. For `cdylib` targets the team also points to `cargo-c` as a tool that
-handles C-ABI build and install steps. Existing Debian `cdylib` packages such as
-`rust-rav1e` exist as prior art and may be instructive.
+**Decision (recorded after review in issue #3):** The direct `cargo build --release --offline` approach is the correct approach for NSS plugin modules and is aligned with accepted Debian practice.
 
-However, `dh-cargo`/`debcargo` are primarily oriented toward packaging Rust library
-crates into the Debian crate registry at `/usr/share/cargo/registry/`, and the
-SONAME injection step needed for NSS integration is not straightforward in that pipeline.
-The upstream maintainer also notes this in `debian/rules`:
+The Debian Rust Team provides two distinct patterns for Rust cdylib packaging:
 
-> *"I've seen `debcargo`. It looks promising, but it doesn't seem to work well
-> for `cdylib`"*
+1. **`cargo-c` (`cbuild`/`cinstall`)** — for Rust libraries with a *C public API*: generates `.so`, C headers, and `.pc` pkg-config files. Used by packages like `rust-rav1e` (`librav1e`) which are linked against from C code.
 
-Vendoring all dependencies into `vendor.tar.gz` and invoking `cargo` directly is the
-approach with a working upstream reference implementation. A future maintainer seeking
-an official Debian upload should review the Debian Rust Team book's `cdylib` chapter
-and the `rust-rav1e` packaging to determine whether a `dh-cargo` or `cargo-c` based
-approach has become the accepted practice by that time.
+2. **Direct `cargo build --release --offline`** — for *plugin modules* with a fixed ABI convention (NSS, codec plugins, etc.) where there are no C headers or pkg-config files to generate. This is the accepted Debian pattern for NSS modules.
+
+`libnss-docker-ng` follows pattern 2: there is no C public API to expose; the ABI is entirely defined by glibc's NSS convention (`_nss_<name>_<fn>` symbols, `libnss_<name>.so.2` SONAME). `cargo-c` would not add any value — its generated headers and pkg-config files are not applicable. `dh-cargo`/`debcargo` target Rust library crates for the Debian Rust ecosystem (`.rlib` in `/usr/share/cargo/registry/`), not cdylib plugins.
+
+The `RUSTFLAGS = -C link-arg=-Wl,-soname,libnss_docker_ng.so.2` approach correctly embeds the SONAME in the ELF header without `cargo-c` or `patchelf`. This is the right method for NSS modules.
+
+Sources: Debian Rust Team Book cdylib page; `cargo-c` upstream README; `rust-rav1e` and `rust-sequoia-octopus-librnp` Debian packaging reviewed in issue #3.
 
 ### Vendoring approach
 
@@ -363,15 +357,19 @@ If the required crates are packaged in Debian, the vendor directory can be dropp
 4. ~~**`libnss-docker` control fields:**~~ **Resolved.** `libnss-docker` 0.02-1.1
    carries no `Conflicts`/`Replaces`/`Provides`. Transition fields are safe to add.
 
-5. **MSRV vs Debian `rustc`:** Upstream pins Rust 1.91.0 in `rust-toolchain.toml`.
-   The packaging was validated with rustc 1.98.0 on the runner. Ubuntu Noble's
-   archive cargo/rustc 1.75.0 are too old for the current vendored tree, so
-   confirm the Debian target suite's toolchain before upload.
+5. **MSRV vs Debian `rustc`:** **Resolved in issue #3.** The transitive dependency
+   chain `url → idna → idna_adapter → icu_* 2.2.0` introduced a `rustc >= 1.86`
+   requirement in crate versions released in early 2025. To maintain compatibility
+   with Debian Trixie's `rustc 1.85.0`, `Cargo.toml` caps the affected crates
+   (`url < 2.5.5`, `idna < 1.1`, `idna_adapter < 1.2.1`). The package builds and
+   all upstream tests pass with `rustc 1.85.0`. `debian/control` declares
+   `rustc (>= 1.85~)` and the `vendor.tar.gz` was regenerated accordingly (198 crates).
 
-6. **`dh-cargo`/`cargo-c` revisit:** The Debian Rust Team book's `cdylib` chapter and
-   `rust-rav1e` packaging were not reviewed in depth. The direct `cargo build --release`
-   approach is working and acceptable for the initial package. Revisit before upload to
-   Debian to confirm whether `dh-cargo` or `cargo-c` is now the accepted practice.
+6. **`dh-cargo`/`cargo-c` revisit:** **Resolved in issue #3.** See "Debian cdylib
+   packaging decision" section above. `cargo build --release --offline` is the
+   correct and well-precedented approach for NSS plugin modules. `cargo-c` is
+   for C-ABI libraries with public headers; `dh-cargo` is for `.rlib` crates in the
+   Debian Rust ecosystem. Neither applies here.
 
 7. **`arm64` CI:** Add `arm64` as a second tested architecture once amd64 packaging
    is validated.
@@ -391,9 +389,9 @@ The initial `debian/` packaging for version `1.2.1-1` is implemented:
 - `debian/copyright` — DEP-5 covering upstream MIT and a preliminary vendor audit
 - `debian/watch` — crates.io via `fakeupstream.cgi`
 - `debian/changelog` — initial entry referencing ITP #1119131
-- `vendor.tar.gz` — offline build tarball (195 crates, Cargo.lock, .cargo/config.toml)
+- `vendor.tar.gz` — offline build tarball (198 crates, Cargo.lock, .cargo/config.toml);
+  dependency version caps applied in `Cargo.toml` to maintain `rustc 1.85` compatibility
 
-The package builds successfully and produces a correctly structured `.deb`. Maintainers
+The package builds successfully and produces a correctly structured `.deb`. Upstream
+unit tests (`cargo test --offline`) run during `dh_auto_test` and pass. Maintainers
 regenerate `vendor.tar.gz` for each upstream version bump via `cargo vendor`.
-CI to build and verify the `.deb` is a future task; CI results are for validation only
-and must not trigger automatic upload.

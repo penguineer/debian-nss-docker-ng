@@ -5,7 +5,7 @@ Maintainer: Stefan Haun <tux@netz39.de>
 Build-Depends: debhelper-compat (= 13),
                dh-nss,
                cargo,
-               rustc
+               rustc (>= 1.85~)
 Standards-Version: 4.7.2
 Homepage: https://github.com/petski/nss-docker-ng
 Rules-Requires-Root: no

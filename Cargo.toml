@@ -13,6 +13,7 @@
 edition = "2021"
 name = "nss-docker-ng"
 version = "1.2.1"
+rust-version = "1.85"
 authors = ["Patrick Kuijvenhoven <patrick.kuijvenhoven@gmail.com>"]
 build = false
 autolib = false
@@ -57,3 +58,14 @@ version = "1.4.0"
 
 [profile.release]
 strip = true
+
+# Transitive dependency version caps to maintain rustc 1.85 (Debian Trixie) compatibility.
+# url >= 2.5.5 and idna >= 1.1.0 pull in idna_adapter >= 1.2.2 which requires rustc >= 1.86.
+[dependencies.url]
+version = ">=2.1, <2.5.5"
+
+[dependencies.idna]
+version = ">=1, <1.1"
+
+[dependencies.idna_adapter]
+version = ">=1, <1.2.1"

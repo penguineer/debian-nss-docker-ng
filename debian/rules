@@ -17,7 +17,7 @@ override_dh_auto_build:
 	ln -sf libnss_docker_ng.so target/release/libnss_docker_ng.so.2
 
 override_dh_auto_test:
-	:
+	cargo test --offline
 
 override_dh_auto_install:
 	:

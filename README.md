@@ -12,17 +12,20 @@ for Debian as the `libnss-docker-ng` binary package.
 
 ## Building
 
-Install the Debian packaging helpers and ensure a recent Cargo/Rust toolchain is
-first on `PATH`, then build the binary package:
+Install the Debian packaging helpers and Rust toolchain, then build the binary
+package:
 
 ```bash
 sudo apt-get install -y debhelper dh-nss cargo rustc
 dpkg-buildpackage -us -uc -b
 ```
 
-Validation on the CI runner used the preinstalled `cargo`/`rustc` 1.98.0. The
-Ubuntu Noble archive `cargo`/`rustc` packages alone are too old for the current
-vendored dependency set.
+The minimum supported Rust version is **1.85** (the version shipped with Debian
+Trixie). The package was tested with `rustc 1.85.0` using Trixie's archive
+packages.
+
+The `vendor.tar.gz` contains all 198 Rust crate dependencies pre-fetched with
+`cargo vendor`. No network access is required during the build.
 
 ## Installing
 
