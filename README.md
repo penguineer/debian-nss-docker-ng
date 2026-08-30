@@ -21,8 +21,9 @@ dpkg-buildpackage -us -uc -b
 ```
 
 The minimum supported Rust version is **1.85** (the version shipped with Debian
-Trixie). The package was tested with `rustc 1.85.0` using Trixie's archive
-packages.
+Trixie). The package has been verified to build and pass its upstream test suite
+with `rustc 1.85.0`. A clean Debian Trixie build and Docker-backed `getent`
+test are tracked in issue #4.
 
 The `vendor.tar.gz` contains all 198 Rust crate dependencies pre-fetched with
 `cargo vendor`. No network access is required during the build.
@@ -74,14 +75,18 @@ sudo apt purge libnss-docker-ng
 
 ## Validation
 
-The following was verified on this host (Ubuntu Noble, glibc 2.39):
+The following was verified on Ubuntu Noble (glibc 2.39) with `rustc 1.85.0`
+(matching Debian Trixie's compiler version):
 
-- Package builds successfully with `rustc 1.85.0` (Debian Trixie's version)
+- Package builds successfully with `rustc 1.85.0`
 - Upstream unit tests (`cargo test --locked --offline`) pass during build
 - `dpkg -i` installs cleanly; `dh_installnss` inserts `docker_ng` into `/etc/nsswitch.conf`
 - glibc can `dlopen` `libnss_docker_ng.so.2`; NSS symbols
   `_nss_docker_ng_gethostbyname2_r` and `_nss_docker_ng_gethostbyaddr_r` resolve
 - `apt remove` reverts `/etc/nsswitch.conf` to its pre-install state and removes all library files
+
+A clean Debian Trixie build environment and a live Docker-backed `getent` test
+are tracked in issue #4.
 
 ## Maintainer notes
 
@@ -95,10 +100,17 @@ curl -L -A cargo --fail \
   -o nss-docker-ng-1.2.1.crate
 tar xzf nss-docker-ng-1.2.1.crate
 cd nss-docker-ng-1.2.1
+# Apply the Trixie compatibility patch before vendoring, so the vendored
+# crates match the Trixie-compatible dependency resolution in Cargo.lock
+patch -p1 < /path/to/debian/patches/0001-trixie-compat-msrv.patch
 mkdir -p .cargo
 cargo vendor > .cargo/config.toml
-tar -zcf ../../vendor.tar.gz Cargo.lock .cargo/config.toml vendor/
+tar -zcf ../../vendor.tar.gz .cargo/config.toml vendor/
 ```
+
+`Cargo.lock` is **not** included in `vendor.tar.gz`. The repository's
+`Cargo.lock` (with the Trixie compatibility patch applied) is the single
+authoritative lockfile used by `cargo --locked --offline` during the build.
 
 ## License
 

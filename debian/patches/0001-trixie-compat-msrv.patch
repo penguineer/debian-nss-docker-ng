@@ -1,6 +1,7 @@
-From: Debian Packaging <packaging@nss-docker-ng>
-Date: Mon, 01 Jan 2024 00:00:00 +0000
+From: Stefan Haun <tux@netz39.de>
+Date: Sun, 30 Aug 2026 13:00:00 +0000
 Subject: Trixie compatibility: cap dependency versions for rustc 1.85 (MSRV)
+Forwarded: not-needed
 
 Debian Trixie ships rustc 1.85.0.  url >= 2.5.5 transitively pulls in
 idna_adapter >= 1.2.2, which depends on ICU4X 2.2.0 and requires
