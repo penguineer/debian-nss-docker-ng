@@ -115,9 +115,26 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Install Rust toolchain
+      - name: Set up Docker BuildKit
         if: steps.pr_check.outputs.skip != 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute APT_WEEK for CI image cache
+        if: steps.pr_check.outputs.skip != 'true'
+        run: echo "APT_WEEK=$(date -u +%G-W%V)" >> "$GITHUB_ENV"
+
+      - name: Build Trixie CI image
+        if: steps.pr_check.outputs.skip != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ci
+          file: ci/Dockerfile
+          push: false
+          load: true
+          tags: trixie-ci:latest
+          build-args: APT_WEEK=${{ env.APT_WEEK }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Install devscripts (dch)
         if: steps.pr_check.outputs.skip != 'true'
@@ -129,6 +146,9 @@ jobs:
         env:
           DEBEMAIL: "github-actions[bot]@users.noreply.github.com"
           DEBFULLNAME: "github-actions[bot]"
+          # Use the Trixie CI image for cargo vendor so the vendor archive is
+          # built with the same Rust toolchain the Debian package build uses.
+          TRIXIE_IMAGE: trixie-ci:latest
         run: |
           set -euo pipefail
           NEW_VER="${{ needs.check.outputs.upstream_version }}"

@@ -1,0 +1,36 @@
+---
+name: Updater Script Tests
+
+# Read-only PR/push validation for the upstream-release automation scripts.
+# Runs the full prepare-update integration test suite (including fixture-based
+# prepare-update.sh tests) with all prerequisites installed.
+# This workflow carries no write permissions and performs no branch/PR creation.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  updater-tests:
+    name: Updater script tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install test prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y devscripts
+
+      - name: Make scripts executable
+        run: chmod +x ci/check-upstream.sh ci/prepare-update.sh ci/tests/test-check-upstream.sh
+
+      - name: Run updater tests
+        run: bash ci/tests/test-check-upstream.sh

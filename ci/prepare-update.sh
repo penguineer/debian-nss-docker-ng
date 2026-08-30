@@ -24,7 +24,8 @@
 #   6. Report dependency, patch, and source changes; write DRAFT_PR=true|false.
 #
 # Packaging-owned files that are NEVER overwritten from the upstream crate:
-#   .github/   ci/   debian/   docs/   README.md (top-level packaging README)
+#   .github/   .gitignore   ci/   debian/   docs/   LICENSE.txt
+#   README.md (top-level packaging README)
 #
 # Exit codes:
 #   0 — success
@@ -86,9 +87,11 @@ info() { echo "INFO: $*"; }
 # synchronising the upstream source snapshot.
 PACKAGING_OWNED=(
     ".github"
+    ".gitignore"
     "ci"
     "debian"
     "docs"
+    "LICENSE.txt"
     "vendor.tar.gz"
     "README.md"
 )
@@ -205,14 +208,28 @@ if [ "$PATCH_STATUS" = "applied" ]; then
     patch -p1 < "$PATCH_FILE"
 fi
 
-info "Running cargo vendor"
+info "Running cargo vendor (--locked)"
 VENDOR_DIR="${WORK_DIR}/vendor"
 CARGO_CONFIG_DIR="${WORK_DIR}/.cargo"
 mkdir -p "$VENDOR_DIR" "$CARGO_CONFIG_DIR"
 
-VENDOR_CONFIG=$(cargo vendor --locked "$VENDOR_DIR" 2>/dev/null \
-    || cargo vendor "$VENDOR_DIR" 2>/dev/null \
-    || die "cargo vendor failed")
+# TRIXIE_IMAGE may be set by the workflow to run cargo inside the authoritative
+# Debian Trixie container so the vendor archive is built with the same toolchain
+# the Debian build will use.  When not set (e.g. during integration tests) the
+# host cargo is used instead.
+if [ -n "${TRIXIE_IMAGE:-}" ]; then
+    info "Vendoring with Trixie image: $TRIXIE_IMAGE"
+    VENDOR_CONFIG=$(docker run --rm \
+        -v "$REPO_ROOT:$REPO_ROOT" \
+        -v "$WORK_DIR:$WORK_DIR" \
+        -w "$REPO_ROOT" \
+        "$TRIXIE_IMAGE" \
+        cargo vendor --locked "$VENDOR_DIR") \
+        || die "cargo vendor --locked failed — locked dependency state could not be resolved with Trixie toolchain; update requires review"
+else
+    VENDOR_CONFIG=$(cargo vendor --locked "$VENDOR_DIR") \
+        || die "cargo vendor --locked failed — update requires review"
+fi
 
 cat > "$CARGO_CONFIG_DIR/config.toml" <<EOF
 $VENDOR_CONFIG
