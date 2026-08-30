@@ -1,0 +1,374 @@
+---
+name: Upstream Release Check
+
+on:
+  schedule:
+    # Run every Monday at 06:00 UTC
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      force_version:
+        description: >
+          Target a specific upstream version (for testing the updater without
+          waiting for a real release). The version is validated through the
+          full crates.io release-safety rules (stable semver, non-yanked,
+          checksum present) via --target-version mode in check-upstream.sh.
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  check:
+    name: Check crates.io for new nss-docker-ng release
+    runs-on: ubuntu-latest
+
+    outputs:
+      update_available: ${{ steps.check.outputs.update_available }}
+      current_version: ${{ steps.check.outputs.current_version }}
+      upstream_version: ${{ steps.check.outputs.upstream_version }}
+      crate_url: ${{ steps.check.outputs.crate_url }}
+      crate_checksum: ${{ steps.check.outputs.crate_checksum }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Make scripts executable
+        run: chmod +x ci/check-upstream.sh ci/prepare-update.sh ci/tests/test-check-upstream.sh
+
+      - name: Run updater tests
+        # Install devscripts so the prepare-update integration tests are not skipped.
+        # The tests run in read-only mode: they use a fixture checkout and do not
+        # modify the repository or create any branch/PR.
+        run: |
+          sudo apt-get install -y devscripts
+          bash ci/tests/test-check-upstream.sh
+
+      - name: Check crates.io for updates
+        id: check
+        run: |
+          set -euo pipefail
+          FORCE="${{ github.event.inputs.force_version }}"
+          if [ -n "$FORCE" ]; then
+            # --target-version validates the requested version through the same
+            # full safety rules as automatic discovery (stable semver, non-yanked,
+            # checksum present).  It is not a shortcut around release policy.
+            CURRENT_VER=$(head -1 debian/changelog | grep -oP '\(\K[^)]+' | sed 's/-[0-9]*$//')
+            OUTPUT=$(bash ci/check-upstream.sh \
+              --current-version "$CURRENT_VER" \
+              --target-version "$FORCE")
+            echo "$OUTPUT"
+          else
+            OUTPUT=$(bash ci/check-upstream.sh)
+            echo "$OUTPUT"
+          fi
+          while IFS='=' read -r key val; do
+            echo "${key,,}=${val}" >> "$GITHUB_OUTPUT"
+          done <<< "$OUTPUT"
+
+      - name: Log result
+        run: |
+          echo "Current version:  ${{ steps.check.outputs.current_version }}"
+          echo "Upstream version: ${{ steps.check.outputs.upstream_version }}"
+          echo "Update available: ${{ steps.check.outputs.update_available }}"
+
+      - name: Reconcile open upstream-update PRs against crates.io yanked state
+        # For each open automation-created upstream-update/X.Y.Z PR, verify that
+        # its crates.io version is still non-yanked.  If it has been yanked, post
+        # a warning comment and add a "yanked-upstream" label so the PR is clearly
+        # flagged.  Unrelated manually-created PRs are never touched.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CRATE_NAME: nss-docker-ng
+          USER_AGENT: "debian-nss-docker-ng-updater/1 (https://github.com/penguineer/debian-nss-docker-ng)"
+        run: |
+          set -euo pipefail
+
+          # Fetch all crates.io versions once to avoid per-PR API calls
+          VERSIONS_JSON=$(curl --silent --fail \
+            --max-time 30 --retry 3 --retry-delay 5 \
+            --user-agent "$USER_AGENT" \
+            "https://crates.io/api/v1/crates/${CRATE_NAME}/versions") \
+            || { echo "WARNING: crates.io API unavailable; skipping reconciliation" >&2; exit 0; }
+
+          # Automation ownership marker written into every PR body by the
+          # "Create pull request" step below.  Both the branch-name shape and
+          # the presence of this exact string must match before a PR is
+          # considered automation-owned.  This prevents inadvertently modifying
+          # manually-created maintainer PRs that happen to use the same branch
+          # naming convention.
+          AUTOMATION_MARKER="This PR was created automatically by the upstream-release-check workflow."
+
+          # List open PRs whose branch name starts with upstream-update/
+          # Include body so we can verify the automation marker.
+          OPEN_UPDATE_PRS=$(gh pr list \
+            --state open \
+            --json number,title,headRefName,labels,body \
+            --jq '[.[] | select(.headRefName | startswith("upstream-update/"))]')
+
+          # Emit one line per PR: "<number> <branch> <base64-body>" so that
+          # multi-line PR bodies survive the read loop without an extra API call.
+          echo "$OPEN_UPDATE_PRS" | jq -r '.[] | "\(.number) \(.headRefName) \(.body | @base64)"' | \
+          while IFS=' ' read -r PR_NUM BRANCH BODY_B64; do
+            # Decode the body from the bulk fetch (no extra API call needed)
+            PR_BODY=$(echo "$BODY_B64" | base64 --decode 2>/dev/null || true)
+
+            # Extract version from branch name: upstream-update/X.Y.Z
+            PR_VERSION="${BRANCH#upstream-update/}"
+            if [ -z "$PR_VERSION" ]; then
+              echo "PR #$PR_NUM: could not extract version from branch $BRANCH — skipping"
+              continue
+            fi
+
+            # Only act on automation-owned PRs (branch shape + marker in body)
+            if ! echo "$PR_BODY" | grep -qF "$AUTOMATION_MARKER"; then
+              echo "PR #$PR_NUM (${PR_VERSION}): automation marker absent — skipping (manually-created PR)"
+              continue
+            fi
+
+            # Check yanked state for this version
+            YANKED=$(echo "$VERSIONS_JSON" | jq -r \
+              --arg ver "$PR_VERSION" \
+              '.versions | map(select(.num == $ver)) | first | .yanked // "unknown"')
+
+            if [ "$YANKED" = "true" ]; then
+              echo "PR #$PR_NUM (${PR_VERSION}): version is YANKED on crates.io — flagging"
+
+              # Add label (create it if missing)
+              gh label create "yanked-upstream" \
+                --color "e11d48" \
+                --description "Target upstream version has been yanked from crates.io" \
+                2>/dev/null || true
+              gh pr edit "$PR_NUM" --add-label "yanked-upstream" || true
+
+              # Check whether we already posted a warning on this PR
+              ALREADY_WARNED=$(gh pr view "$PR_NUM" \
+                --json comments \
+                --jq '[.comments[].body | select(contains("yanked on crates.io"))] | length')
+
+              if [ "${ALREADY_WARNED:-0}" -eq 0 ]; then
+                COMMENT_BODY="⚠️ **Upstream version \`${PR_VERSION}\` has been yanked on crates.io.**"
+                COMMENT_BODY="${COMMENT_BODY}"$'\n\n'
+                COMMENT_BODY="${COMMENT_BODY}This PR was created by the automated upstream-release-check workflow,"
+                COMMENT_BODY="${COMMENT_BODY} but the upstream release it tracks (\`${PR_VERSION}\`) is no longer"
+                COMMENT_BODY="${COMMENT_BODY} available as a stable, non-yanked release on crates.io."
+                COMMENT_BODY="${COMMENT_BODY}"$'\n\n'
+                COMMENT_BODY="${COMMENT_BODY}Please review and close this PR if the upstream release has been"
+                COMMENT_BODY="${COMMENT_BODY} permanently withdrawn, or wait for a corrected upstream release before merging."
+                gh pr comment "$PR_NUM" --body "$COMMENT_BODY"
+              fi
+
+            elif [ "$YANKED" = "unknown" ]; then
+              echo "PR #$PR_NUM (${PR_VERSION}): version not found on crates.io — skipping"
+            else
+              echo "PR #$PR_NUM (${PR_VERSION}): version still non-yanked — OK"
+            fi
+          done
+
+  prepare:
+    name: Prepare update PR
+    needs: check
+    if: needs.check.outputs.update_available == 'true'
+    runs-on: ubuntu-latest
+
+    outputs:
+      branch: ${{ steps.prepare.outputs.branch }}
+      commit_sha: ${{ steps.prepare.outputs.commit_sha }}
+      draft_pr: ${{ steps.prepare.outputs.draft_pr }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Make scripts executable
+        run: chmod +x ci/prepare-update.sh ci/check-upstream.sh
+
+      - name: Check for existing update PR
+        id: pr_check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          NEW_VER="${{ needs.check.outputs.upstream_version }}"
+          EXISTING=$(gh pr list \
+            --state open \
+            --search "nss-docker-ng ${NEW_VER} in:title" \
+            --json number,title \
+            --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            echo "PR #$EXISTING already exists for $NEW_VER — skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No existing PR for $NEW_VER"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker BuildKit
+        if: steps.pr_check.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute APT_WEEK for CI image cache
+        if: steps.pr_check.outputs.skip != 'true'
+        run: echo "APT_WEEK=$(date -u +%G-W%V)" >> "$GITHUB_ENV"
+
+      - name: Build Trixie CI image
+        if: steps.pr_check.outputs.skip != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ci
+          file: ci/Dockerfile
+          push: false
+          load: true
+          tags: trixie-ci:latest
+          build-args: APT_WEEK=${{ env.APT_WEEK }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Install devscripts (dch)
+        if: steps.pr_check.outputs.skip != 'true'
+        run: sudo apt-get install -y devscripts
+
+      - name: Prepare update branch
+        if: steps.pr_check.outputs.skip != 'true'
+        id: prepare
+        env:
+          # Use the Trixie CI image for cargo vendor so the vendor archive is
+          # built with the same Rust toolchain the Debian package build uses.
+          TRIXIE_IMAGE: trixie-ci:latest
+        run: |
+          set -euo pipefail
+          NEW_VER="${{ needs.check.outputs.upstream_version }}"
+          BRANCH="upstream-update/${NEW_VER}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # dch maintainer identity: read from debian/control (package owner),
+          # not the GitHub Actions bot, so changelog entries are attributed to
+          # the established package maintainer.
+          MAINTAINER=$(grep -m1 '^Maintainer:' debian/control | sed 's/^Maintainer: *//')
+          export DEBFULLNAME="${MAINTAINER% <*}"
+          export DEBEMAIL="${MAINTAINER##*<}"; DEBEMAIL="${DEBEMAIL%>}"
+
+          git checkout -b "$BRANCH"
+
+          # The script operates on the current checkout (no --repo-root needed
+          # in production; --repo-root is used only by integration tests).
+          PREPARE_OUTPUT=$(bash ci/prepare-update.sh \
+            "$NEW_VER" \
+            "${{ needs.check.outputs.crate_url }}" \
+            "${{ needs.check.outputs.crate_checksum }}")
+          echo "$PREPARE_OUTPUT"
+
+          DRAFT_PR=$(echo "$PREPARE_OUTPUT" | grep '^DRAFT_PR=' | cut -d= -f2 | tail -1)
+          CARGO_TOML_CHANGED=$(echo "$PREPARE_OUTPUT" | grep '^CARGO_TOML_CHANGED=' | cut -d= -f2 | tail -1)
+          CARGO_LOCK_CHANGED=$(echo "$PREPARE_OUTPUT" | grep '^CARGO_LOCK_CHANGED=' | cut -d= -f2 | tail -1)
+          PATCH_STATUS=$(echo "$PREPARE_OUTPUT" | grep '^PATCH_STATUS=' | cut -d= -f2 | tail -1)
+
+          git add -A
+          git commit -m "chore: update nss-docker-ng to ${NEW_VER}"
+          COMMIT_SHA=$(git rev-parse HEAD)
+
+          echo "draft_pr=${DRAFT_PR}"          >> "$GITHUB_OUTPUT"
+          echo "branch=${BRANCH}"              >> "$GITHUB_OUTPUT"
+          echo "commit_sha=${COMMIT_SHA}"      >> "$GITHUB_OUTPUT"
+          echo "cargo_toml_changed=${CARGO_TOML_CHANGED}" >> "$GITHUB_OUTPUT"
+          echo "cargo_lock_changed=${CARGO_LOCK_CHANGED}"  >> "$GITHUB_OUTPUT"
+          echo "patch_status=${PATCH_STATUS}"  >> "$GITHUB_OUTPUT"
+
+      - name: Push update branch
+        if: steps.pr_check.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          BRANCH="${{ steps.prepare.outputs.branch }}"
+          SHA="${{ steps.prepare.outputs.commit_sha }}"
+          echo "Pushing branch $BRANCH (commit $SHA)"
+          git push origin "$BRANCH"
+
+      - name: Create pull request
+        if: steps.pr_check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          NEW_VER="${{ needs.check.outputs.upstream_version }}"
+          CURRENT_VER="${{ needs.check.outputs.current_version }}"
+          BRANCH="${{ steps.prepare.outputs.branch }}"
+          COMMIT_SHA="${{ steps.prepare.outputs.commit_sha }}"
+          DRAFT="${{ steps.prepare.outputs.draft_pr }}"
+          CRATE_URL="${{ needs.check.outputs.crate_url }}"
+          CRATE_CHECKSUM="${{ needs.check.outputs.crate_checksum }}"
+          CARGO_TOML_CHANGED="${{ steps.prepare.outputs.cargo_toml_changed }}"
+          CARGO_LOCK_CHANGED="${{ steps.prepare.outputs.cargo_lock_changed }}"
+          PATCH_STATUS="${{ steps.prepare.outputs.patch_status }}"
+          CRATES_PAGE="https://crates.io/crates/nss-docker-ng/${NEW_VER}"
+
+          DRAFT_FLAG=""
+          DRAFT_NOTE=""
+          if [ "$DRAFT" = "true" ]; then
+            DRAFT_FLAG="--draft"
+            DRAFT_NOTE=$'\n\n> **⚠️ DRAFT:** The Trixie/MSRV quilt patch requires human review before this PR can be merged. See CI output for details.'
+          fi
+
+          PR_BODY="## Upstream release: nss-docker-ng ${NEW_VER}
+
+          | Field | Value |
+          |-------|-------|
+          | Previous upstream version | \`${CURRENT_VER}\` |
+          | New upstream version | \`${NEW_VER}\` |
+          | Crate archive URL | [download](${CRATE_URL}) |
+          | crates.io release page | [${CRATES_PAGE}](${CRATES_PAGE}) |
+          | Archive checksum (sha256) | \`${CRATE_CHECKSUM}\` |
+          | Update branch commit | \`${COMMIT_SHA}\` |
+
+          ### Observed changes
+
+          | Item | Changed |
+          |------|---------|
+          | \`Cargo.toml\` | ${CARGO_TOML_CHANGED} |
+          | \`Cargo.lock\` / dependency set | ${CARGO_LOCK_CHANGED} |
+          | Trixie/MSRV quilt patch | status: ${PATCH_STATUS} |
+
+          See the [CI run for branch \`${BRANCH}\`](../actions) for the full dependency diff and patch evaluation output.
+
+          ### Review checklist
+
+          - [ ] Upstream release notes reviewed (see crates.io page above)
+          - [ ] Dependency changes acceptable (\`Cargo.lock\` diff in CI output)
+          - [ ] Quilt patch status confirmed (applied / updated / dropped as needed)
+          - [ ] License/copyright metadata reviewed if \`Cargo.toml\` changed
+          - [ ] CI passes on this branch
+          - [ ] Package installs and smoke test passes${DRAFT_NOTE}
+
+          ---
+          *This PR was created automatically by the upstream-release-check workflow.*"
+
+          gh pr create \
+            --title "chore: update nss-docker-ng to ${NEW_VER}" \
+            --body "$PR_BODY" \
+            --base main \
+            --head "$BRANCH" \
+            --label "upstream-update" \
+            $DRAFT_FLAG \
+            || gh pr create \
+              --title "chore: update nss-docker-ng to ${NEW_VER}" \
+              --body "$PR_BODY" \
+              --base main \
+              --head "$BRANCH" \
+              $DRAFT_FLAG
+
+  run-ci-on-update-branch:
+    name: Run package CI on update branch
+    needs: [check, prepare]
+    if: needs.check.outputs.update_available == 'true' && needs.prepare.outputs.branch != ''
+    uses: ./.github/workflows/ci.yml
+    with:
+      # Pass the exact commit SHA of the prepared update branch so package CI
+      # checks the precise state placed in the update PR — not the caller's rev.
+      ref: ${{ needs.prepare.outputs.commit_sha }}
+    secrets: inherit
