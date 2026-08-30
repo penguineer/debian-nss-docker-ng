@@ -1,0 +1,118 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: nss-docker-ng
+Upstream-Contact: Patrick Kuijvenhoven <patrick.kuijvenhoven+nss-docker-ng@gmail.com>
+Source: https://github.com/petski/nss-docker-ng
+
+Files: Cargo.lock Cargo.toml LICENSE src/*
+Copyright: 2024 Patrick Kuijvenhoven <patrick.kuijvenhoven+nss-docker-ng@gmail.com>
+License: Expat
+
+Files: .github/* .gitignore README.md docs/* debian/* LICENSE.txt
+Copyright: 2026 Stefan Haun and contributors
+License: Expat
+
+Files: vendor.tar.gz
+Copyright: various
+License: various
+Comment:
+ This archive is generated with cargo vendor from the crates.io release of
+ nss-docker-ng 1.2.1 and embeds third-party Rust crates under several license
+ expressions declared in the vendored Cargo.toml files. A preliminary audit of
+ the embedded metadata found the following major crates and licenses:
+  - docker-api 0.14.0: MIT
+  - docker-api-stubs 0.5.0: MIT
+  - containers-api 0.9.0: MIT
+  - hyperlocal 0.8.0: MIT
+  - tokio 1.52.1: MIT
+  - tokio-macros 2.7.0: MIT
+  - tokio-util 0.7.18: MIT
+  - libc 0.2.186: MIT or Apache-2.0
+  - debug_print 1.0.0: MIT or Apache-2.0
+  - serde 1.0.228: MIT or Apache-2.0
+  - serde_json 1.0.149: MIT or Apache-2.0
+  - thiserror 1.0.69: MIT or Apache-2.0
+  - futures-util 0.3.32: MIT or Apache-2.0
+  - libnss 0.9.0: LGPL-3.0
+ .
+  The embedded `libnss` crate is LGPL-3.0 and is linked into the produced NSS
+  module, so LGPL compliance for the final binary package must be reviewed
+  carefully before any official upload.
+  .
+  The license-expression counts observed in the vendored metadata were:
+  - MIT OR Apache-2.0: 104 crates
+  - MIT: 37 crates
+  - Unicode-3.0: 18 crates
+  - Apache-2.0 OR MIT: 10 crates
+  - MIT/Apache-2.0: 7 crates
+  - Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT: 5 crates
+  - Unlicense OR MIT: 3 crates
+  - Apache-2.0: 2 crates
+  - BSD-2-Clause OR Apache-2.0 OR MIT: 2 crates
+  - Additional single-crate expressions: 0BSD OR MIT OR Apache-2.0,
+    Apache-2.0 / MIT, Apache-2.0 OR BSL-1.0,
+    MIT OR Apache-2.0 OR LGPL-2.1-or-later, MIT OR Zlib OR Apache-2.0,
+    (MIT OR Apache-2.0) AND Unicode-3.0, and MPL-2.0.
+ .
+ Full transitive review of every embedded license file remains required before
+ an official Debian upload.
+
+License: Expat
+ Permission is hereby granted, free of charge, to any person obtaining a copy
+ of this software and associated documentation files (the "Software"), to deal
+ in the Software without restriction, including without limitation the rights
+ to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ copies of the Software, and to permit persons to whom the Software is
+ furnished to do so, subject to the following conditions:
+ .
+ The above copyright notice and this permission notice shall be included in all
+ copies or substantial portions of the Software.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ SOFTWARE.
+
+License: Apache-2.0
+ On Debian systems, the full text of the Apache License, Version 2.0 can be
+ found in /usr/share/common-licenses/Apache-2.0.
+
+License: LGPL-3.0
+ On Debian systems, the full text of the GNU Lesser General Public License
+ version 3 can be found in /usr/share/common-licenses/LGPL-3.
+
+License: MPL-2.0
+ On Debian systems, the full text of the Mozilla Public License, version 2.0
+ can be found in /usr/share/common-licenses/MPL-2.0.
+
+License: Unicode-3.0
+ See the embedded license files shipped by the vendored ICU and unicode-related
+ crates inside vendor.tar.gz for the full Unicode license text.
+
+License: Unlicense
+ This is free and unencumbered software released into the public domain.
+ .
+ Anyone is free to copy, modify, publish, use, compile, sell, or
+ distribute this software, either in source code form or as a compiled
+ binary, for any purpose, commercial or non-commercial, and by any
+ means.
+ .
+ In jurisdictions that recognize copyright laws, the author or authors
+ of this software dedicate any and all copyright interest in the
+ software to the public domain. We make this dedication for the benefit
+ of the public at large and to the detriment of our heirs and
+ successors. We intend this dedication to be an overt act of
+ relinquishment in perpetuity of all present and future rights to this
+ software under copyright law.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ OTHER DEALINGS IN THE SOFTWARE.
+ .
+ For more information, please refer to <https://unlicense.org/>

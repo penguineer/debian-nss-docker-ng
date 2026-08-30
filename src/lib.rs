@@ -1,0 +1,673 @@
+extern crate debug_print;
+extern crate docker_api;
+
+use debug_print::debug_eprintln;
+use docker_api::opts::ContainerListOpts;
+use docker_api::Docker;
+use libnss::host::{AddressFamily, Addresses, Host, HostHooks};
+use libnss::interop::Response;
+use libnss::libnss_host_hooks;
+use std::error::Error;
+use std::net::{IpAddr, Ipv4Addr};
+use std::str::FromStr;
+
+static SUFFIX: &str = ".docker";
+static DOCKER_URI: &str = "unix:///var/run/docker.sock";
+static CONTAINER_SUBDOMAINS_ALLOWED_LABEL: &str =
+    ".com.github.petski.nss-docker-ng.container-subdomains-allowed";
+
+fn with_suffix(name: &str) -> String {
+    format!("{name}{SUFFIX}")
+}
+
+struct DockerNG;
+libnss_host_hooks!(docker_ng, DockerNG);
+
+impl HostHooks for DockerNG {
+    fn get_all_entries() -> Response<Vec<Host>> {
+        Response::NotFound // TODO: Implement me, see https://github.com/petski/nss-docker-ng/issues/1
+    }
+
+    fn get_host_by_name(name: &str, family: AddressFamily) -> Response<Host> {
+        let provider = DefaultDockerUriProvider;
+        get_host_by_name_with_provider(name, family, &provider)
+    }
+
+    fn get_host_by_addr(_: IpAddr) -> Response<Host> {
+        Response::NotFound // TODO: Implement me, see https://github.com/petski/nss-docker-ng/issues/2
+    }
+}
+
+trait DockerUriProvider {
+    fn get_docker_uri(&self) -> String;
+}
+
+struct DefaultDockerUriProvider;
+
+impl DockerUriProvider for DefaultDockerUriProvider {
+    fn get_docker_uri(&self) -> String {
+        DOCKER_URI.to_string()
+    }
+}
+
+#[tokio::main]
+async fn get_host_by_name_with_provider(
+    query: &str,
+    family: AddressFamily,
+    provider: &dyn DockerUriProvider,
+) -> Response<Host> {
+    return match get_host_by_name_with_provider_inner(query, family, provider).await {
+        Ok(Some(host)) => Response::Success(host),
+        Ok(None) => Response::NotFound,
+        Err(_e) => {
+            debug_eprintln!("get_host_by_name '{}' failed: {}", query, _e);
+            Response::Unavail
+        }
+    };
+}
+
+async fn get_host_by_name_with_provider_inner(
+    query: &str,
+    family: AddressFamily,
+    provider: &dyn DockerUriProvider,
+) -> Result<Option<Host>, Box<dyn Error>> {
+    // Check if the query ends with the expected suffix and if the address family is IPv4
+    if !(query.ends_with(SUFFIX)
+        && family == AddressFamily::IPv4 // TODO you no v6? See https://github.com/petski/nss-docker-ng/issues/3
+        && query.len() > SUFFIX.len())
+    {
+        return Ok(None);
+    }
+
+    // Initialize Docker API client
+    let mut docker = Docker::new(provider.get_docker_uri())?;
+    docker.adjust_api_version().await?;
+
+    // Strip suffix from query
+    let query_stripped = &query[..query.len() - SUFFIX.len()];
+
+    // Fetch container information
+    let inspect_result = 'block: {
+        match docker.containers().get(query_stripped).inspect().await {
+            Ok(query_stripped_result) => query_stripped_result,
+            Err(_e) => {
+                debug_eprintln!("Failed to inspect container '{}': {}", query_stripped, _e);
+
+                // Fallback: search all running containers for a matching network alias
+                match find_container_by_alias(&docker, query_stripped).await {
+                    Ok(Some(result)) => break 'block result,
+                    Ok(None) => {
+                        debug_eprintln!("No container found with alias '{}'", query_stripped);
+                    }
+                    Err(_alias_err) => {
+                        debug_eprintln!(
+                            "Alias lookup failed for '{}': {}",
+                            query_stripped,
+                            _alias_err
+                        );
+                    }
+                }
+
+                if let Some((last_dot_index, _)) = query_stripped.match_indices('.').next_back() {
+                    let query_stripped_main_domain =
+                        &query_stripped[(last_dot_index + '.'.len_utf8())..];
+                    match docker
+                        .containers()
+                        .get(query_stripped_main_domain)
+                        .inspect()
+                        .await
+                    {
+                        Ok(query_stripped_main_domain_result) => {
+                            match query_stripped_main_domain_result.config.as_ref().and_then(
+                                |config| {
+                                    config.labels.as_ref().and_then(|labels| {
+                                        labels.get(CONTAINER_SUBDOMAINS_ALLOWED_LABEL)
+                                    })
+                                },
+                            ) {
+                                Some(label_value) => {
+                                    if label_value.eq("true")
+                                        || label_value.eq("True")
+                                        || label_value.eq("1")
+                                    {
+                                        break 'block query_stripped_main_domain_result;
+                                    } else {
+                                        return Ok(None);
+                                    }
+                                }
+                                None => return Ok(None),
+                            }
+                        }
+                        Err(_e) => return Ok(None),
+                    }
+                }
+                return Ok(None);
+            }
+        }
+    };
+
+    // Name of the container (remove leading "/" if necessary)
+    let name = match inspect_result.name {
+        Some(mut name) => {
+            if name.starts_with('/') {
+                name.remove(0);
+            }
+            name
+        }
+        None => return Err("No Name".into()),
+    };
+
+    // From https://docs.docker.com/engine/api/v1.44/#tag/Container/operation/ContainerInspect:
+    // > Network mode to use for this container. Supported standard values are: bridge, host, none, and
+    // > container:<name|id>. Any other value is taken as a custom network's name to which this container
+    // > should connect to
+    let mut network_mode = match inspect_result.host_config.as_ref().and_then(|host_config| {
+        host_config
+            .get("NetworkMode")
+            .and_then(|value| value.as_str())
+    }) {
+        Some(network_mode) => {
+            debug_eprintln!("Container '{}' has NetworkMode '{}'", name, network_mode);
+            network_mode
+        }
+        None => return Err("Could not find NetworkMode".into()),
+    };
+
+    // NetworkMode host, none, and those starting with "container:" don't have an IP address
+    if ["none", "host"].contains(&network_mode) || network_mode.starts_with("container:") {
+        debug_eprintln!(
+            "Container '{}' is in NetworkMode {}, no IP here",
+            name,
+            network_mode
+        );
+        return Ok(None);
+    }
+
+    // Extract networks from network settings
+    let networks = match inspect_result
+        .network_settings
+        .and_then(|settings| settings.networks)
+    {
+        Some(networks) => {
+            if networks.is_empty() {
+                return Err("Found 0 networks".into());
+            }
+            debug_eprintln!("Found {} network(s) for '{}'", networks.keys().len(), name);
+            networks
+        }
+        None => return Err("Found no networks".into()),
+    };
+
+    // The documentation on https://docs.docker.com/engine/api/v1.44/#tag/Container/operation/ContainerInspect
+    // is incomplete. There is another NetworkMode "default":
+    // > which is bridge for Docker Engine, and overlay for Swarm.
+    //
+    // See: https://github.com/docker/docker-py/issues/986
+    if network_mode == "default" && !networks.contains_key("default") {
+        network_mode = "bridge"; // TODO add swarm support. Is this really used/needed?
+    }
+
+    // Get the end point settings for the network with the name in network_mode
+    let end_point_settings = match networks.get(network_mode) {
+        Some(end_point_settings) => end_point_settings,
+        None => return Err(format!("Network '{network_mode}' not found").into()),
+    };
+
+    let ip_address = match &end_point_settings.ip_address {
+        Some(ip_address) => {
+            if ip_address.is_empty() {
+                return Err("IP address is an empty string".into());
+            }
+            ip_address
+        }
+        None => return Err("Endpoint has no IP address".into()),
+    };
+
+    match Ipv4Addr::from_str(ip_address) {
+        Ok(ip) => {
+            let id = match inspect_result.id.as_ref() {
+                Some(id) => id,
+                None => return Err("No Id".into()),
+            };
+
+            let short_id = id.get(..12).unwrap_or(id);
+            let mut aliases = vec![with_suffix(short_id)];
+
+            if name.ne(query_stripped) {
+                let query_alias = with_suffix(query_stripped);
+                if !aliases.contains(&query_alias) {
+                    aliases.push(query_alias);
+                }
+            }
+
+            let host_name = with_suffix(&name);
+
+            // Include network aliases from the endpoint settings
+            if let Some(endpoint_aliases) = &end_point_settings.aliases {
+                for alias in endpoint_aliases {
+                    let alias_with_suffix = with_suffix(alias);
+                    if alias_with_suffix != host_name && !aliases.contains(&alias_with_suffix) {
+                        aliases.push(alias_with_suffix);
+                    }
+                }
+            }
+
+            Ok(Some(Host {
+                name: host_name,
+                addresses: Addresses::V4(vec![ip]),
+                aliases,
+            }))
+        }
+        Err(_e) => Err(format!("Failed to parse IP address '{ip_address}': {_e}").into()),
+    }
+}
+
+/// Search all running containers for one whose network aliases contain the given name.
+async fn find_container_by_alias(
+    docker: &Docker,
+    alias: &str,
+) -> Result<Option<docker_api::models::ContainerInspect200Response>, Box<dyn Error>> {
+    let list_opts = ContainerListOpts::builder().build();
+    let containers = docker.containers().list(&list_opts).await?;
+
+    for container in &containers {
+        let id = match &container.id {
+            Some(id) => id,
+            None => continue,
+        };
+
+        let inspect = match docker.containers().get(id).inspect().await {
+            Ok(inspect) => inspect,
+            Err(_e) => {
+                debug_eprintln!(
+                    "Alias lookup: failed to inspect container '{}': {}",
+                    id.get(..12).unwrap_or(id),
+                    _e
+                );
+                continue;
+            }
+        };
+
+        let networks = match inspect
+            .network_settings
+            .as_ref()
+            .and_then(|s| s.networks.as_ref())
+        {
+            Some(networks) => networks,
+            None => continue,
+        };
+
+        for endpoint in networks.values() {
+            if let Some(aliases) = &endpoint.aliases {
+                if aliases.iter().any(|a| a == alias) {
+                    debug_eprintln!(
+                        "Found container '{}' by alias '{}'",
+                        id.get(..12).unwrap_or(id),
+                        alias
+                    );
+                    return Ok(Some(inspect));
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mockall::{mock, predicate::*};
+    use mockito::{Mock, Server, ServerOpts};
+
+    mock! {
+        pub DockerUriProvider {}
+        impl DockerUriProvider for DockerUriProvider {
+            fn get_docker_uri(&self) -> String;
+        }
+    }
+
+    #[test]
+    fn test_get_host_by_name() {
+        let (_server, _mocks, mock_provider) = init_mocking_features();
+
+        assert_eq!(
+            get_host_by_name_with_provider(".foo", AddressFamily::IPv4, &mock_provider),
+            Response::NotFound
+        );
+
+        assert_eq!(
+            get_host_by_name_with_provider("foo.docker", AddressFamily::IPv6, &mock_provider),
+            Response::NotFound
+        );
+
+        assert_eq!(
+            get_host_by_name_with_provider(".docker", AddressFamily::IPv4, &mock_provider),
+            Response::NotFound
+        );
+
+        assert_eq!(
+            get_host_by_name_with_provider(
+                "sunny-default-bridge.docker",
+                AddressFamily::IPv4,
+                &mock_provider,
+            ),
+            Response::Success(Host {
+                name: "sunny-default-bridge.docker".to_string(),
+                aliases: vec!["c0ffeec0ffee.docker".to_string()],
+                addresses: Addresses::V4(vec![Ipv4Addr::new(172, 29, 0, 2)]),
+            })
+        );
+
+        assert_eq!(
+            get_host_by_name_with_provider(
+                "sunny-default-bridge-container-subdomains-allowed.docker",
+                AddressFamily::IPv4,
+                &mock_provider,
+            ),
+            Response::Success(Host {
+                name: "sunny-default-bridge-container-subdomains-allowed.docker".to_string(),
+                aliases: vec!["c0ffeec0ffee.docker".to_string()],
+                addresses: Addresses::V4(vec![Ipv4Addr::new(172, 29, 0, 2)]),
+            })
+        );
+
+        assert_eq!(
+            get_host_by_name_with_provider(
+                "mega.very.sunny-default-bridge-container-subdomains-allowed.docker",
+                AddressFamily::IPv4,
+                &mock_provider,
+            ),
+            Response::Success(Host {
+                name: "sunny-default-bridge-container-subdomains-allowed.docker".to_string(),
+                aliases: vec![
+                    "c0ffeec0ffee.docker".to_string(),
+                    "mega.very.sunny-default-bridge-container-subdomains-allowed.docker"
+                        .to_string(),
+                ],
+                addresses: Addresses::V4(vec![Ipv4Addr::new(172, 29, 0, 2)]),
+            })
+        );
+
+        assert_eq!(
+            get_host_by_name_with_provider("rainy-404.docker", AddressFamily::IPv4, &mock_provider),
+            Response::NotFound
+        );
+
+        assert_eq!(
+            get_host_by_name_with_provider(
+                "rainy-no-name.docker",
+                AddressFamily::IPv4,
+                &mock_provider,
+            ),
+            Response::Unavail
+        );
+
+        assert_eq!(
+            get_host_by_name_with_provider(
+                "rainy-no-network-mode.docker",
+                AddressFamily::IPv4,
+                &mock_provider,
+            ),
+            Response::Unavail
+        );
+
+        for name in [
+            "rainy-network-mode-none.docker",
+            "rainy-network-mode-host.docker",
+            "rainy-network-mode-container.docker",
+        ] {
+            assert_eq!(
+                get_host_by_name_with_provider(name, AddressFamily::IPv4, &mock_provider),
+                Response::NotFound
+            );
+        }
+
+        assert_eq!(
+            get_host_by_name_with_provider(
+                "rainy-zero-networks.docker",
+                AddressFamily::IPv4,
+                &mock_provider,
+            ),
+            Response::Unavail
+        );
+
+        assert_eq!(
+            get_host_by_name_with_provider(
+                "rainy-no-networks.docker",
+                AddressFamily::IPv4,
+                &mock_provider,
+            ),
+            Response::Unavail
+        );
+
+        assert_eq!(
+            get_host_by_name_with_provider(
+                "rainy-network-not-exists.docker",
+                AddressFamily::IPv4,
+                &mock_provider,
+            ),
+            Response::Unavail
+        );
+
+        assert_eq!(
+            get_host_by_name_with_provider(
+                "rainy-ip-address-empty.docker",
+                AddressFamily::IPv4,
+                &mock_provider,
+            ),
+            Response::Unavail
+        );
+
+        assert_eq!(
+            get_host_by_name_with_provider(
+                "rainy-no-ip-address.docker",
+                AddressFamily::IPv4,
+                &mock_provider,
+            ),
+            Response::Unavail
+        );
+
+        assert_eq!(
+            get_host_by_name_with_provider(
+                "rainy-unparseable-ip-address.docker",
+                AddressFamily::IPv4,
+                &mock_provider,
+            ),
+            Response::Unavail
+        );
+
+        assert_eq!(
+            get_host_by_name_with_provider(
+                "rainy-no-id.docker",
+                AddressFamily::IPv4,
+                &mock_provider,
+            ),
+            Response::Unavail
+        );
+
+        // Test alias lookup: "my-service" is a network alias for "sunny-alias-lookup"
+        assert_eq!(
+            get_host_by_name_with_provider(
+                "my-service.docker",
+                AddressFamily::IPv4,
+                &mock_provider,
+            ),
+            Response::Success(Host {
+                name: "sunny-alias-lookup.docker".to_string(),
+                aliases: vec![
+                    "deadbeefdead.docker".to_string(),
+                    "my-service.docker".to_string(),
+                    "my-service-alias.docker".to_string(),
+                ],
+                addresses: Addresses::V4(vec![Ipv4Addr::new(172, 29, 0, 3)]),
+            })
+        );
+    }
+
+    /*
+     * Returns a server and its mocks based on https://github.com/lipanski/mockito
+     */
+    fn init_mocking_features() -> (Server, [Mock; 20], MockDockerUriProvider) {
+        let mut server = Server::new_with_opts(ServerOpts {
+            assert_on_drop: true,
+            ..Default::default()
+        });
+
+        let url = server.url();
+
+        let mut mock_provider = MockDockerUriProvider::new();
+        mock_provider
+            .expect_get_docker_uri()
+            .return_const(url.to_owned());
+
+        let _version_mock = server
+            .mock("GET", "/version")
+            .expect(17)
+            .with_body_from_file("tests/resources/v1.44/version.body")
+            .create();
+
+        let _inspect_mock_sunny_default_bridge = server
+            .mock("GET", "/v1.44/containers/sunny-default-bridge/json")
+            .with_body_from_file("tests/resources/v1.44/containers/sunny-default-bridge/json.body")
+            .create();
+
+        let _inspect_mock_mega_very_sunny_default_bridge_container_subdomains_allowed = server
+            .mock("GET", "/v1.44/containers/mega.very.sunny-default-bridge-container-subdomains-allowed/json")
+            .with_status(404)
+            .with_body_from_file("tests/resources/v1.44/containers/mega.very.sunny-default-bridge-container-subdomains-allowed/json.body")
+            .create();
+
+        let _inspect_mock_sunny_default_bridge_container_subdomains_allowed = server
+            .mock("GET", "/v1.44/containers/sunny-default-bridge-container-subdomains-allowed/json")
+            .expect(2)
+            .with_body_from_file("tests/resources/v1.44/containers/sunny-default-bridge-container-subdomains-allowed/json.body")
+            .create();
+
+        let _inspect_mock_rainy_404 = server
+            .mock("GET", "/v1.44/containers/rainy-404/json")
+            .with_status(404)
+            .with_body_from_file("tests/resources/v1.44/containers/rainy-404/json.body")
+            .create();
+
+        let _inspect_mock_rainy_no_name = server
+            .mock("GET", "/v1.44/containers/rainy-no-name/json")
+            .with_body_from_file("tests/resources/v1.44/containers/rainy-no-name/json.body")
+            .create();
+
+        let _inspect_mock_rainy_no_network_mode = server
+            .mock("GET", "/v1.44/containers/rainy-no-network-mode/json")
+            .with_body_from_file("tests/resources/v1.44/containers/rainy-no-network-mode/json.body")
+            .create();
+
+        let _inspect_mock_rainy_network_mode_none = server
+            .mock("GET", "/v1.44/containers/rainy-network-mode-none/json")
+            .with_body_from_file(
+                "tests/resources/v1.44/containers/rainy-network-mode-none/json.body",
+            )
+            .create();
+
+        let _inspect_mock_rainy_network_mode_host = server
+            .mock("GET", "/v1.44/containers/rainy-network-mode-host/json")
+            .with_body_from_file(
+                "tests/resources/v1.44/containers/rainy-network-mode-host/json.body",
+            )
+            .create();
+
+        let _inspect_mock_rainy_network_mode_container = server
+            .mock("GET", "/v1.44/containers/rainy-network-mode-container/json")
+            .with_body_from_file(
+                "tests/resources/v1.44/containers/rainy-network-mode-container/json.body",
+            )
+            .create();
+
+        let _inspect_mock_rainy_zero_networks = server
+            .mock("GET", "/v1.44/containers/rainy-zero-networks/json")
+            .with_body_from_file("tests/resources/v1.44/containers/rainy-zero-networks/json.body")
+            .create();
+
+        let _inspect_mock_rainy_no_networks = server
+            .mock("GET", "/v1.44/containers/rainy-no-networks/json")
+            .with_body_from_file("tests/resources/v1.44/containers/rainy-no-networks/json.body")
+            .create();
+
+        let _inspect_mock_rainy_network_not_exists = server
+            .mock("GET", "/v1.44/containers/rainy-network-not-exists/json")
+            .with_body_from_file(
+                "tests/resources/v1.44/containers/rainy-network-not-exists/json.body",
+            )
+            .create();
+
+        let _inspect_mock_rainy_ip_address_empty = server
+            .mock("GET", "/v1.44/containers/rainy-ip-address-empty/json")
+            .expect(1)
+            .with_body_from_file(
+                "tests/resources/v1.44/containers/rainy-ip-address-empty/json.body",
+            )
+            .create();
+
+        let _inspect_mock_rainy_no_ip_address = server
+            .mock("GET", "/v1.44/containers/rainy-no-ip-address/json")
+            .with_body_from_file("tests/resources/v1.44/containers/rainy-no-ip-address/json.body")
+            .create();
+
+        let _inspect_mock_rainy_unparseable_ip_address = server
+            .mock("GET", "/v1.44/containers/rainy-unparseable-ip-address/json")
+            .with_body_from_file(
+                "tests/resources/v1.44/containers/rainy-unparseable-ip-address/json.body",
+            )
+            .create();
+
+        let _inspect_mock_rainy_no_id = server
+            .mock("GET", "/v1.44/containers/rainy-no-id/json")
+            .with_body_from_file("tests/resources/v1.44/containers/rainy-no-id/json.body")
+            .create();
+
+        // Alias lookup mocks: "my-service" direct lookup returns 404, triggering
+        // the container list → inspect fallback path
+        let _container_list_mock = server
+            .mock("GET", "/v1.44/containers/json")
+            .expect_at_least(1)
+            .with_body_from_file("tests/resources/v1.44/containers/json.body")
+            .create();
+
+        let _inspect_mock_my_service_404 = server
+            .mock("GET", "/v1.44/containers/my-service/json")
+            .with_status(404)
+            .with_body(r#"{"message":"No such container: my-service"}"#)
+            .create();
+
+        let _inspect_mock_sunny_alias_lookup = server
+            .mock("GET", "/v1.44/containers/deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef/json")
+            .expect_at_least(1)
+            .with_body_from_file("tests/resources/v1.44/containers/sunny-alias-lookup/json.body")
+            .create();
+
+        (
+            server,
+            [
+                _version_mock,
+                _inspect_mock_sunny_default_bridge,
+                _inspect_mock_mega_very_sunny_default_bridge_container_subdomains_allowed,
+                _inspect_mock_sunny_default_bridge_container_subdomains_allowed,
+                _inspect_mock_rainy_404,
+                _inspect_mock_rainy_no_name,
+                _inspect_mock_rainy_no_network_mode,
+                _inspect_mock_rainy_network_mode_none,
+                _inspect_mock_rainy_network_mode_host,
+                _inspect_mock_rainy_network_mode_container,
+                _inspect_mock_rainy_zero_networks,
+                _inspect_mock_rainy_no_networks,
+                _inspect_mock_rainy_network_not_exists,
+                _inspect_mock_rainy_ip_address_empty,
+                _inspect_mock_rainy_no_ip_address,
+                _inspect_mock_rainy_unparseable_ip_address,
+                _inspect_mock_rainy_no_id,
+                _container_list_mock,
+                _inspect_mock_my_service_404,
+                _inspect_mock_sunny_alias_lookup,
+            ],
+            mock_provider,
+        )
+    }
+}

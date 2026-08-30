@@ -1,25 +1,89 @@
-# nss-docker-ng Debian Package
+# nss-docker-ng Debian packaging
 
-> This project aims to provide a clean, reproducible Debian package for [`nss-docker-ng`](https://github.com/djmaze/nss-docker-ng).
+This repository packages [`nss-docker-ng`](https://github.com/petski/nss-docker-ng)
+for Debian as the `libnss-docker-ng` binary package.
 
-The repository is intended to contain the Debian packaging and automation needed to build, validate, and publish installable `.deb` packages for current Debian releases.
+## Repository contents
 
+- upstream source snapshot for `nss-docker-ng` 1.2.1
+- `vendor.tar.gz` generated with `cargo vendor`
+- Debian packaging in `debian/`
+- packaging notes in `docs/packaging-strategy.md`
 
-## Maintainers
+## Building
 
-* Stefan Haun ([@penguineer](https://github.com/penguineer))
+Install the Debian packaging helpers and ensure a recent Cargo/Rust toolchain is
+first on `PATH`, then build the binary package:
 
+```bash
+sudo apt-get install -y debhelper dh-nss cargo rustc
+dpkg-buildpackage -us -uc -b
+```
 
-## Contributing
+Validation on the CI runner used the preinstalled `cargo`/`rustc` 1.98.0. The
+Ubuntu Noble archive `cargo`/`rustc` packages alone are too old for the current
+vendored dependency set.
 
-PRs are welcome!
+## Installing
 
-If possible, please stick to the following guidelines:
+After a successful build, install the generated package from the parent
+directory:
 
-* Keep PRs reasonably small and their scope limited to a feature or module within the code.
-* If a large change is planned, it is best to open a feature request issue first, then link subsequent PRs to this
-  issue, so that the PRs move the code towards the intended feature.
+```bash
+sudo apt install ../libnss-docker-ng_1.2.1-1_amd64.deb
+```
 
+`dh_installnss` updates `/etc/nsswitch.conf` automatically so that `docker_ng`
+is added to the `hosts:` line.
+
+## NSS configuration
+
+The package manages `/etc/nsswitch.conf` automatically. If you need to inspect
+the expected result, the relevant line looks like:
+
+```text
+hosts: files docker_ng dns resolve
+```
+
+## Usage
+
+Make sure the system can talk to Docker through `/var/run/docker.sock`, then
+look up a container name in the `.docker` domain:
+
+```bash
+getent hosts my-container.docker
+```
+
+## Uninstalling
+
+Remove the package:
+
+```bash
+sudo apt remove libnss-docker-ng
+```
+
+Purge it and remove the `nsswitch.conf` change:
+
+```bash
+sudo apt purge libnss-docker-ng
+```
+
+## Maintainer notes
+
+To refresh vendored dependencies for the packaged upstream release:
+
+```bash
+mkdir -p work
+cd work
+curl -L -A cargo --fail \
+  https://static.crates.io/crates/nss-docker-ng/nss-docker-ng-1.2.1.crate \
+  -o nss-docker-ng-1.2.1.crate
+tar xzf nss-docker-ng-1.2.1.crate
+cd nss-docker-ng-1.2.1
+mkdir -p .cargo
+cargo vendor > .cargo/config.toml
+tar -zcf ../../vendor.tar.gz Cargo.lock .cargo/config.toml vendor/
+```
 
 ## License
 
