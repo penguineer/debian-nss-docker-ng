@@ -47,7 +47,7 @@ echo "=== Verifying expected library paths (multiarch=$MULTIARCH) ==="
 
 echo "$CONTENTS" | grep "$MULTIARCH" | grep 'libnss_docker_ng'
 
-# Must contain both the .so (symlink) and .so.2 (soname library).
+# Must contain both the ELF library (.so) and the NSS-loader symlink (.so.2).
 echo "$CONTENTS" | grep -q "usr/lib/${MULTIARCH}/libnss_docker_ng.so$" \
     || { echo "FAIL: libnss_docker_ng.so not found in expected multiarch path"; exit 1; }
 echo "$CONTENTS" | grep -q "usr/lib/${MULTIARCH}/libnss_docker_ng.so.2" \
