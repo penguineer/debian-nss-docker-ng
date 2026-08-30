@@ -23,3 +23,7 @@ debian/tmp/
 !tests/
 !tests/resources/
 !tests/resources/**
+
+# quilt state directory
+.pc/
+debian/*.debhelper

@@ -13,11 +13,11 @@ override_dh_auto_configure:
 	tar zxf vendor.tar.gz
 
 override_dh_auto_build:
-	cargo build --release --offline
+	cargo build --release --locked --offline
 	ln -sf libnss_docker_ng.so target/release/libnss_docker_ng.so.2
 
 override_dh_auto_test:
-	cargo test --offline
+	cargo test --locked --offline
 
 override_dh_auto_install:
 	:

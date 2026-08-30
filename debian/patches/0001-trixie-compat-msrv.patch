@@ -1,0 +1,36 @@
+From: Stefan Haun <tux@netz39.de>
+Subject: Set MSRV and cap transitive deps for Debian Trixie (rustc 1.85)
+Forwarded: not-needed
+Last-Update: 2026-08-30
+
+The transitive dependency chain url >= 2.5.5 -> idna >= 1.1.0 ->
+idna_adapter >= 1.2.2 pulls in ICU4X 2.2.0, which requires rustc >= 1.86.
+Debian Trixie ships rustc 1.85.0.  Cap the three affected crates at
+versions whose MSRV is 1.67 and set rust-version accordingly so tooling
+can detect the requirement.
+
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -13,6 +13,7 @@
+ edition = "2021"
+ name = "nss-docker-ng"
+ version = "1.2.1"
++rust-version = "1.85"
+ authors = ["Patrick Kuijvenhoven <patrick.kuijvenhoven@gmail.com>"]
+ build = false
+ autolib = false
+@@ -57,3 +58,14 @@
+ 
+ [profile.release]
+ strip = true
++
++# Transitive dependency version caps to maintain rustc 1.85 (Debian Trixie) compatibility.
++# url >= 2.5.5 and idna >= 1.1.0 pull in idna_adapter >= 1.2.2 which requires rustc >= 1.86.
++[dependencies.url]
++version = ">=2.1, <2.5.5"
++
++[dependencies.idna]
++version = ">=1, <1.1"
++
++[dependencies.idna_adapter]
++version = ">=1, <1.2.1"

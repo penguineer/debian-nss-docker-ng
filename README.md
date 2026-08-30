@@ -59,17 +59,29 @@ getent hosts my-container.docker
 
 ## Uninstalling
 
-Remove the package:
+Remove the package; `dh_installnss` removes the `docker_ng` entry from
+`/etc/nsswitch.conf` automatically during removal:
 
 ```bash
 sudo apt remove libnss-docker-ng
 ```
 
-Purge it and remove the `nsswitch.conf` change:
+To additionally purge any leftover package state:
 
 ```bash
 sudo apt purge libnss-docker-ng
 ```
+
+## Validation
+
+The following was verified on this host (Ubuntu Noble, glibc 2.39):
+
+- Package builds successfully with `rustc 1.85.0` (Debian Trixie's version)
+- Upstream unit tests (`cargo test --locked --offline`) pass during build
+- `dpkg -i` installs cleanly; `dh_installnss` inserts `docker_ng` into `/etc/nsswitch.conf`
+- glibc can `dlopen` `libnss_docker_ng.so.2`; NSS symbols
+  `_nss_docker_ng_gethostbyname2_r` and `_nss_docker_ng_gethostbyaddr_r` resolve
+- `apt remove` reverts `/etc/nsswitch.conf` to its pre-install state and removes all library files
 
 ## Maintainer notes
 
