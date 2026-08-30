@@ -354,7 +354,7 @@ If the required crates are packaged in Debian, the vendor directory can be dropp
 
 Implement the `debian/` packaging directory:
 
-1. `debian/control` — source/binary metadata, `Conflicts`/`Replaces`, `Suggests: docker.io`
+1. `debian/control` — source/binary metadata, `Conflicts`/`Replaces`
 2. `debian/rules` — `dh $@` with `cargo build --release --offline` and `patchelf` SONAME step
 3. `debian/libnss-docker-ng.nss` — NSS snippet (`hosts before=dns,resolve docker_ng`)
 4. `debian/install` — install `libnss_docker_ng.so*` to `usr/lib/${DEB_HOST_MULTIARCH}`
