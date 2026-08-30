@@ -5,20 +5,24 @@
 #   prepare-update.sh NEW_VERSION CRATE_URL CRATE_CHECKSUM
 #
 # Required environment (set by the calling workflow):
-#   DEBEMAIL   — maintainer email for dch
+#   DEBEMAIL    — maintainer email for dch
 #   DEBFULLNAME — maintainer name for dch
 #
 # What this script does:
-#   1. Download and verify the upstream .crate archive.
-#   2. Extract Cargo.toml and Cargo.lock from the new release.
-#   3. Re-evaluate the Trixie/MSRV quilt patch (apply, test, skip if unneeded).
-#   4. Regenerate vendor.tar.gz from the final patched dependency state.
+#   1. Download and verify the upstream .crate archive (aborts on checksum mismatch).
+#   2. Synchronise upstream-owned files into the repository tree, preserving
+#      packaging-owned paths (.github/, ci/, debian/, docs/, packaging README).
+#   3. Re-evaluate the Trixie/MSRV quilt patch.
+#   4. Regenerate vendor.tar.gz with .cargo/config.toml and vendor/ (no Cargo.lock).
 #   5. Update debian/changelog with the new version.
-#   6. Report dependency, patch, and notable changes to stdout.
+#   6. Report dependency, patch, and source changes; write DRAFT_PR=true|false.
+#
+# Packaging-owned files that are NEVER overwritten from the upstream crate:
+#   .github/   ci/   debian/   docs/   README.md (top-level packaging README)
 #
 # Exit codes:
 #   0 — success
-#   1 — fatal error
+#   1 — fatal error (repository is not modified on error before step 2 completes)
 #
 # After this script completes, the repository tree is ready for a commit.
 set -euo pipefail
@@ -39,6 +43,32 @@ USER_AGENT="debian-nss-docker-ng-updater/1 (https://github.com/penguineer/debian
 die()  { echo "ERROR: $*" >&2; exit 1; }
 info() { echo "INFO: $*"; }
 
+# ── Packaging-owned paths (never overwritten from upstream crate) ─────────────
+# These are paths relative to the repository root that belong to the Debian
+# packaging layer.  Any file rooted under one of these prefixes is skipped when
+# synchronising the upstream source snapshot.
+PACKAGING_OWNED=(
+    ".github"
+    "ci"
+    "debian"
+    "docs"
+    "vendor.tar.gz"
+    "README.md"
+)
+
+is_packaging_owned() {
+    # $1 = path relative to repo root
+    local p="$1"
+    local owned
+    for owned in "${PACKAGING_OWNED[@]}"; do
+        # Match exact path or path under directory
+        if [ "$p" = "$owned" ] || [[ "$p" == "$owned/"* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 # ── 1. Download and verify ────────────────────────────────────────────────────
 
 info "Downloading $CRATE_NAME $NEW_VERSION from $CRATE_URL"
@@ -58,7 +88,7 @@ if [ "$ACTUAL_CHECKSUM" != "$EXPECTED_CHECKSUM" ]; then
 fi
 info "Checksum OK: $ACTUAL_CHECKSUM"
 
-# ── 2. Extract upstream Cargo.toml and Cargo.lock ────────────────────────────
+# ── 2. Extract and synchronise upstream source files ─────────────────────────
 
 mkdir -p "$CRATE_EXTRACT"
 tar -xzf "$CRATE_ARCHIVE" -C "$CRATE_EXTRACT"
@@ -70,12 +100,43 @@ UPSTREAM_DIR="${CRATE_EXTRACT}/${CRATE_NAME}-${NEW_VERSION}"
 [ -f "$UPSTREAM_DIR/Cargo.toml" ] || die "No Cargo.toml in upstream crate"
 [ -f "$UPSTREAM_DIR/Cargo.lock" ] || die "No Cargo.lock in upstream crate"
 
-info "Updating Cargo.toml and Cargo.lock from upstream"
-# Save the previous Cargo.lock for the diff report at the end
+# Save the previous Cargo.lock for the diff report
 OLD_CARGO_LOCK="${WORK_DIR}/Cargo.lock.old"
 cp "$REPO_ROOT/Cargo.lock" "$OLD_CARGO_LOCK"
-cp "$UPSTREAM_DIR/Cargo.toml" "$REPO_ROOT/Cargo.toml"
-cp "$UPSTREAM_DIR/Cargo.lock" "$REPO_ROOT/Cargo.lock"
+
+info "Synchronising upstream source files (preserving packaging-owned paths)"
+
+# Step 2a: copy every upstream file that is not packaging-owned into the repo.
+# Use find on the upstream dir so we get every file, including new ones added
+# by the new release.
+while IFS= read -r -d '' upstream_file; do
+    # Compute path relative to upstream dir
+    rel="${upstream_file#$UPSTREAM_DIR/}"
+    if is_packaging_owned "$rel"; then
+        info "  skipping (packaging-owned): $rel"
+    else
+        dest="$REPO_ROOT/$rel"
+        mkdir -p "$(dirname "$dest")"
+        cp "$upstream_file" "$dest"
+    fi
+done < <(find "$UPSTREAM_DIR" -type f -print0)
+
+# Step 2b: remove any upstream-owned file from the repo that no longer exists
+# in the new upstream crate (deleted files).
+while IFS= read -r -d '' repo_file; do
+    rel="${repo_file#$REPO_ROOT/}"
+    # Skip packaging-owned paths
+    is_packaging_owned "$rel" && continue
+    # Skip .git/
+    [[ "$rel" == ".git/"* ]] && continue
+    upstream_counterpart="$UPSTREAM_DIR/$rel"
+    if [ ! -f "$upstream_counterpart" ]; then
+        info "  removing (deleted upstream): $rel"
+        rm "$repo_file"
+    fi
+done < <(find "$REPO_ROOT" -type f -not -path "$REPO_ROOT/.git/*" -print0)
+
+info "Upstream source synchronisation complete"
 
 # ── 3. Evaluate Trixie/MSRV quilt patch ──────────────────────────────────────
 
@@ -84,22 +145,18 @@ PATCH_SERIES="$PATCH_DIR/series"
 MSRV_PATCH=$(grep -m1 'trixie' "$PATCH_SERIES" 2>/dev/null || echo "")
 
 PATCH_STATUS="not-applicable"
+PATCH_FILE=""
 
 if [ -n "$MSRV_PATCH" ] && [ -f "$PATCH_DIR/$MSRV_PATCH" ]; then
     PATCH_FILE="$PATCH_DIR/$MSRV_PATCH"
     info "Evaluating $MSRV_PATCH against new upstream"
 
-    # Try applying the patch in dry-run mode
     cd "$REPO_ROOT"
     if patch --dry-run -p1 < "$PATCH_FILE" >/dev/null 2>&1; then
         info "Patch applies cleanly — keeping as-is"
         PATCH_STATUS="applied"
     else
-        info "Patch does not apply cleanly — attempting to check if it is still needed"
-
-        # Check if the patch's intent (adding rust-version and dep caps) is
-        # already present in the new Cargo.toml.  If upstream already caps the
-        # deps at suitable versions, the patch may not be needed.
+        info "Patch does not apply cleanly — checking if it is still needed"
         NEW_RUST_VERSION=$(grep -oP '(?<=^rust-version = ")[^"]+' "$UPSTREAM_DIR/Cargo.toml" || true)
         if [ -n "$NEW_RUST_VERSION" ]; then
             info "Upstream now declares rust-version = $NEW_RUST_VERSION — patch may be obsolete"
@@ -109,7 +166,6 @@ if [ -n "$MSRV_PATCH" ] && [ -f "$PATCH_DIR/$MSRV_PATCH" ]; then
         fi
         echo ""
         echo "⚠️  PATCH REVIEW REQUIRED: $MSRV_PATCH"
-        echo "   The Trixie/MSRV patch does not apply cleanly to the new upstream."
         echo "   Status: $PATCH_STATUS"
         echo "   A human must review and update the patch before this PR can be merged."
     fi
@@ -117,7 +173,7 @@ fi
 
 # ── 4. Regenerate vendor.tar.gz ───────────────────────────────────────────────
 
-# Apply the patch if it is still applicable before vendoring
+# Apply the patch before vendoring (so the locked/patched lockfile is used)
 cd "$REPO_ROOT"
 if [ "$PATCH_STATUS" = "applied" ]; then
     info "Applying patch before vendoring"
@@ -126,25 +182,32 @@ fi
 
 info "Running cargo vendor"
 VENDOR_DIR="${WORK_DIR}/vendor"
-mkdir -p "$VENDOR_DIR"
+CARGO_CONFIG_DIR="${WORK_DIR}/.cargo"
+mkdir -p "$VENDOR_DIR" "$CARGO_CONFIG_DIR"
 
-# cargo vendor into a temp dir so we can control the archive
-cargo vendor --locked "$VENDOR_DIR" >/dev/null 2>&1 \
-    || cargo vendor "$VENDOR_DIR" >/dev/null 2>&1 \
-    || die "cargo vendor failed"
+# cargo vendor prints the [source.crates-io] config block to stdout; capture it
+VENDOR_CONFIG=$(cargo vendor --locked "$VENDOR_DIR" 2>/dev/null \
+    || cargo vendor "$VENDOR_DIR" 2>/dev/null \
+    || die "cargo vendor failed")
 
-# Revert patch before re-checking tree (the patch is stored in debian/patches)
+# Write the vendor configuration that Cargo needs for offline builds
+cat > "$CARGO_CONFIG_DIR/config.toml" <<EOF
+$VENDOR_CONFIG
+EOF
+
+# Revert patch so the repo tree stays unpatched (patch lives in debian/patches)
 if [ "$PATCH_STATUS" = "applied" ]; then
     patch -R -p1 < "$PATCH_FILE"
 fi
 
-info "Creating vendor.tar.gz (excluding Cargo.lock)"
-# Remove any Cargo.lock that cargo vendor may have written inside vendor
+# Remove any Cargo.lock inside vendor/ (must not shadow the repo lockfile)
 find "$VENDOR_DIR" -name "Cargo.lock" -delete
 
+info "Creating vendor.tar.gz (.cargo/config.toml + vendor/, no Cargo.lock)"
 tar -czf "$REPO_ROOT/vendor.tar.gz" \
     --owner=0 --group=0 \
     -C "$WORK_DIR" \
+    .cargo \
     vendor
 
 info "vendor.tar.gz created"
@@ -166,6 +229,14 @@ dch \
 
 # ── 6. Report changes ────────────────────────────────────────────────────────
 
+CARGO_TOML_CHANGED=false
+git diff --quiet HEAD -- Cargo.toml 2>/dev/null || CARGO_TOML_CHANGED=true
+
+CARGO_LOCK_CHANGED=false
+if ! diff -q "$OLD_CARGO_LOCK" "$REPO_ROOT/Cargo.lock" >/dev/null 2>&1; then
+    CARGO_LOCK_CHANGED=true
+fi
+
 echo ""
 echo "════════════════════════════════════════════════════════════"
 echo " Package update summary"
@@ -175,17 +246,18 @@ echo " New upstream:      $NEW_VERSION"
 echo " Crate URL:         $CRATE_URL"
 echo " Checksum (sha256): $ACTUAL_CHECKSUM"
 echo ""
-echo " Patch status:      $PATCH_STATUS"
+echo " Cargo.toml changed:      $CARGO_TOML_CHANGED"
+echo " Cargo.lock changed:      $CARGO_LOCK_CHANGED"
+echo " Patch status:            $PATCH_STATUS"
 
 if [ "$PATCH_STATUS" = "needs-review" ] || [ "$PATCH_STATUS" = "possibly-obsolete" ]; then
     echo ""
     echo "⚠️  ACTION REQUIRED: The Trixie/MSRV patch needs human review."
-    echo "   This PR is created as a DRAFT to flag the unresolved point."
+    echo "   This PR is opened as a DRAFT to flag the unresolved point."
 fi
 
 echo ""
-echo " Cargo dependency changes (Cargo.lock diff):"
-cd "$REPO_ROOT"
+echo " Cargo.lock diff (stat):"
 git diff --no-index --stat \
     "$OLD_CARGO_LOCK" \
     "$REPO_ROOT/Cargo.lock" 2>/dev/null || true
@@ -193,9 +265,13 @@ git diff --no-index --stat \
 echo "════════════════════════════════════════════════════════════"
 echo ""
 
-# Write a machine-readable flag for the workflow to detect draft state
+# Machine-readable flags consumed by the workflow
+DRAFT_PR=false
 if [ "$PATCH_STATUS" = "needs-review" ] || [ "$PATCH_STATUS" = "possibly-obsolete" ]; then
-    echo "DRAFT_PR=true"
-else
-    echo "DRAFT_PR=false"
+    DRAFT_PR=true
 fi
+
+echo "DRAFT_PR=${DRAFT_PR}"
+echo "CARGO_TOML_CHANGED=${CARGO_TOML_CHANGED}"
+echo "CARGO_LOCK_CHANGED=${CARGO_LOCK_CHANGED}"
+echo "PATCH_STATUS=${PATCH_STATUS}"

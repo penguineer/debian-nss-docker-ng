@@ -8,7 +8,11 @@ on:
   workflow_dispatch:
     inputs:
       force_version:
-        description: "Override upstream version (for testing; leave blank for auto)"
+        description: >
+          Target a specific upstream version (for testing the updater without
+          waiting for a real release). The version is still validated through
+          the normal crates.io release-safety rules (stable, non-yanked,
+          correct semver form).
         required: false
         default: ""
 
@@ -42,11 +46,64 @@ jobs:
         id: check
         run: |
           set -euo pipefail
-          OUTPUT=$(bash ci/check-upstream.sh)
-          echo "$OUTPUT"
-          while IFS='=' read -r key val; do
-            echo "${key}=${val}" >> "$GITHUB_OUTPUT"
-          done <<< "$OUTPUT"
+
+          # When force_version is set, pass it as the "current" version so that
+          # check-upstream.sh validates the forced version through the normal
+          # crates.io safety rules and outputs its metadata.
+          FORCE="${{ github.event.inputs.force_version }}"
+          if [ -n "$FORCE" ]; then
+            # Use a version guaranteed to be lower than any real release so the
+            # forced target always appears as an update.  The forced version
+            # itself is validated (stable, non-yanked, correct semver) by the
+            # same jq filter used for automatic discovery.
+            OUTPUT=$(bash ci/check-upstream.sh --current-version "0.0.0")
+            echo "$OUTPUT"
+
+            # Extract the validated upstream metadata from the normal check
+            VALIDATED_VER=$(echo "$OUTPUT" | grep '^UPSTREAM_VERSION=' | cut -d= -f2)
+            if [ "$VALIDATED_VER" != "$FORCE" ]; then
+              # The forced version is not the newest; confirm it still exists
+              # and is non-yanked by querying crates.io directly for that version.
+              RESP=$(curl --silent --fail \
+                --max-time 30 \
+                --user-agent "debian-nss-docker-ng-updater/1 (https://github.com/penguineer/debian-nss-docker-ng)" \
+                "https://crates.io/api/v1/crates/nss-docker-ng/versions")
+              YANKED=$(echo "$RESP" | jq -r --arg v "$FORCE" \
+                '.versions | map(select(.num == $v)) | first | .yanked // "missing"')
+              if [ "$YANKED" != "false" ]; then
+                echo "ERROR: force_version=$FORCE is yanked or does not exist on crates.io (yanked=$YANKED)" >&2
+                exit 1
+              fi
+              CHECKSUM=$(echo "$RESP" | jq -r --arg v "$FORCE" \
+                '.versions | map(select(.num == $v)) | first | .checksum')
+              if [ -z "$CHECKSUM" ] || [ "$CHECKSUM" = "null" ]; then
+                echo "ERROR: No checksum for force_version=$FORCE" >&2
+                exit 1
+              fi
+              CRATE_URL="https://static.crates.io/crates/nss-docker-ng/${FORCE}/download"
+              CURRENT_VER=$(head -1 debian/changelog | grep -oP '\(\K[^)]+' | sed 's/-[0-9]*$//')
+              {
+                echo "update_available=true"
+                echo "current_version=${CURRENT_VER}"
+                echo "upstream_version=${FORCE}"
+                echo "crate_url=${CRATE_URL}"
+                echo "crate_checksum=${CHECKSUM}"
+              } >> "$GITHUB_OUTPUT"
+            else
+              # Forced version matches the validated newest — use normal output
+              while IFS='=' read -r key val; do
+                echo "${key}=${val}" >> "$GITHUB_OUTPUT"
+              done <<< "$OUTPUT"
+              # Ensure update_available is true for forced runs
+              echo "update_available=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            OUTPUT=$(bash ci/check-upstream.sh)
+            echo "$OUTPUT"
+            while IFS='=' read -r key val; do
+              echo "${key}=${val}" >> "$GITHUB_OUTPUT"
+            done <<< "$OUTPUT"
+          fi
 
       - name: Log result
         run: |
@@ -57,8 +114,13 @@ jobs:
   prepare:
     name: Prepare update PR
     needs: check
-    if: needs.check.outputs.update_available == 'true' || (github.event_name == 'workflow_dispatch' && github.event.inputs.force_version != '')
+    if: needs.check.outputs.update_available == 'true'
     runs-on: ubuntu-latest
+
+    outputs:
+      branch: ${{ steps.prepare.outputs.branch }}
+      commit_sha: ${{ steps.prepare.outputs.commit_sha }}
+      draft_pr: ${{ steps.prepare.outputs.draft_pr }}
 
     steps:
       - name: Check out repository
@@ -69,39 +131,13 @@ jobs:
       - name: Make scripts executable
         run: chmod +x ci/prepare-update.sh ci/check-upstream.sh
 
-      - name: Determine target version
-        id: version
-        run: |
-          set -euo pipefail
-          if [ -n "${{ github.event.inputs.force_version }}" ]; then
-            # workflow_dispatch override: use the specified version directly.
-            # Construct the crate URL and fetch the checksum from crates.io.
-            NEW_VER="${{ github.event.inputs.force_version }}"
-            CRATE_URL="https://static.crates.io/crates/nss-docker-ng/${NEW_VER}/download"
-            CRATE_CHECKSUM=$(curl --silent --fail \
-              --max-time 30 \
-              --user-agent "debian-nss-docker-ng-updater/1 (https://github.com/penguineer/debian-nss-docker-ng)" \
-              "https://crates.io/api/v1/crates/nss-docker-ng/versions" | \
-              jq -r --arg ver "$NEW_VER" '.versions | map(select(.num == $ver)) | first | .checksum')
-            CURRENT_VER=$(head -1 debian/changelog | grep -oP '\(\K[^)]+' | sed 's/-[0-9]*$//')
-          else
-            NEW_VER="${{ needs.check.outputs.upstream_version }}"
-            CRATE_URL="${{ needs.check.outputs.crate_url }}"
-            CRATE_CHECKSUM="${{ needs.check.outputs.crate_checksum }}"
-            CURRENT_VER="${{ needs.check.outputs.current_version }}"
-          fi
-          echo "new_version=${NEW_VER}" >> "$GITHUB_OUTPUT"
-          echo "crate_url=${CRATE_URL}" >> "$GITHUB_OUTPUT"
-          echo "crate_checksum=${CRATE_CHECKSUM}" >> "$GITHUB_OUTPUT"
-          echo "current_version=${CURRENT_VER}" >> "$GITHUB_OUTPUT"
-
       - name: Check for existing update PR
         id: pr_check
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          NEW_VER="${{ steps.version.outputs.new_version }}"
+          NEW_VER="${{ needs.check.outputs.upstream_version }}"
           EXISTING=$(gh pr list \
             --state open \
             --search "nss-docker-ng ${NEW_VER} in:title" \
@@ -131,43 +167,44 @@ jobs:
           DEBFULLNAME: "github-actions[bot]"
         run: |
           set -euo pipefail
-          NEW_VER="${{ steps.version.outputs.new_version }}"
+          NEW_VER="${{ needs.check.outputs.upstream_version }}"
           BRANCH="upstream-update/${NEW_VER}"
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Create and switch to update branch
           git checkout -b "$BRANCH"
 
-          # Run the update logic; capture last line for DRAFT_PR flag
+          # Run the update logic; capture machine-readable flags from stdout
           PREPARE_OUTPUT=$(bash ci/prepare-update.sh \
             "$NEW_VER" \
-            "${{ steps.version.outputs.crate_url }}" \
-            "${{ steps.version.outputs.crate_checksum }}")
+            "${{ needs.check.outputs.crate_url }}" \
+            "${{ needs.check.outputs.crate_checksum }}")
           echo "$PREPARE_OUTPUT"
 
           DRAFT_PR=$(echo "$PREPARE_OUTPUT" | grep '^DRAFT_PR=' | cut -d= -f2 | tail -1)
-          echo "draft_pr=${DRAFT_PR}" >> "$GITHUB_OUTPUT"
-          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+          CARGO_TOML_CHANGED=$(echo "$PREPARE_OUTPUT" | grep '^CARGO_TOML_CHANGED=' | cut -d= -f2 | tail -1)
+          CARGO_LOCK_CHANGED=$(echo "$PREPARE_OUTPUT" | grep '^CARGO_LOCK_CHANGED=' | cut -d= -f2 | tail -1)
+          PATCH_STATUS=$(echo "$PREPARE_OUTPUT" | grep '^PATCH_STATUS=' | cut -d= -f2 | tail -1)
 
-          # Stage and commit all changes
           git add -A
           git commit -m "chore: update nss-docker-ng to ${NEW_VER}"
+          COMMIT_SHA=$(git rev-parse HEAD)
+
+          echo "draft_pr=${DRAFT_PR}"          >> "$GITHUB_OUTPUT"
+          echo "branch=${BRANCH}"              >> "$GITHUB_OUTPUT"
+          echo "commit_sha=${COMMIT_SHA}"      >> "$GITHUB_OUTPUT"
+          echo "cargo_toml_changed=${CARGO_TOML_CHANGED}" >> "$GITHUB_OUTPUT"
+          echo "cargo_lock_changed=${CARGO_LOCK_CHANGED}"  >> "$GITHUB_OUTPUT"
+          echo "patch_status=${PATCH_STATUS}"  >> "$GITHUB_OUTPUT"
 
       - name: Push update branch
         if: steps.pr_check.outputs.skip != 'true'
         run: |
-          git push origin "${{ steps.prepare.outputs.branch }}"
-
-      - name: Fetch upstream release notes URL
-        if: steps.pr_check.outputs.skip != 'true'
-        id: release_notes
-        run: |
-          NEW_VER="${{ steps.version.outputs.new_version }}"
-          CRATES_URL="https://crates.io/crates/nss-docker-ng/${NEW_VER}"
-          GH_URL="https://github.com/petski/nss-docker-ng/releases/tag/v${NEW_VER}"
-          echo "crates_url=${CRATES_URL}" >> "$GITHUB_OUTPUT"
-          echo "gh_url=${GH_URL}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          BRANCH="${{ steps.prepare.outputs.branch }}"
+          SHA="${{ steps.prepare.outputs.commit_sha }}"
+          echo "Pushing branch $BRANCH (commit $SHA)"
+          git push origin "$BRANCH"
 
       - name: Create pull request
         if: steps.pr_check.outputs.skip != 'true'
@@ -175,19 +212,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          NEW_VER="${{ steps.version.outputs.new_version }}"
-          CURRENT_VER="${{ steps.version.outputs.current_version }}"
+          NEW_VER="${{ needs.check.outputs.upstream_version }}"
+          CURRENT_VER="${{ needs.check.outputs.current_version }}"
           BRANCH="${{ steps.prepare.outputs.branch }}"
+          COMMIT_SHA="${{ steps.prepare.outputs.commit_sha }}"
           DRAFT="${{ steps.prepare.outputs.draft_pr }}"
-          CRATE_URL="${{ steps.version.outputs.crate_url }}"
-          CRATES_PAGE="${{ steps.release_notes.outputs.crates_url }}"
-          GH_RELEASE="${{ steps.release_notes.outputs.gh_url }}"
+          CRATE_URL="${{ needs.check.outputs.crate_url }}"
+          CRATE_CHECKSUM="${{ needs.check.outputs.crate_checksum }}"
+          CARGO_TOML_CHANGED="${{ steps.prepare.outputs.cargo_toml_changed }}"
+          CARGO_LOCK_CHANGED="${{ steps.prepare.outputs.cargo_lock_changed }}"
+          PATCH_STATUS="${{ steps.prepare.outputs.patch_status }}"
+          CRATES_PAGE="https://crates.io/crates/nss-docker-ng/${NEW_VER}"
 
           DRAFT_FLAG=""
           DRAFT_NOTE=""
           if [ "$DRAFT" = "true" ]; then
             DRAFT_FLAG="--draft"
-            DRAFT_NOTE=$'\n\n> **⚠️ DRAFT:** The Trixie/MSRV quilt patch requires human review before this PR can be merged. See prepare-update output above.'
+            DRAFT_NOTE=$'\n\n> **⚠️ DRAFT:** The Trixie/MSRV quilt patch requires human review before this PR can be merged. See CI output for details.'
           fi
 
           PR_BODY="## Upstream release: nss-docker-ng ${NEW_VER}
@@ -197,22 +238,27 @@ jobs:
           | Previous upstream version | \`${CURRENT_VER}\` |
           | New upstream version | \`${NEW_VER}\` |
           | Crate archive URL | [download](${CRATE_URL}) |
-          | crates.io page | [${CRATES_PAGE}](${CRATES_PAGE}) |
-          | GitHub release | [v${NEW_VER}](${GH_RELEASE}) |
+          | crates.io release page | [${CRATES_PAGE}](${CRATES_PAGE}) |
+          | Archive checksum (sha256) | \`${CRATE_CHECKSUM}\` |
+          | Update branch commit | \`${COMMIT_SHA}\` |
 
-          ### What changed
+          ### Observed changes
 
-          - \`Cargo.toml\` and \`Cargo.lock\` updated from upstream crate.
-          - \`vendor.tar.gz\` regenerated from the final patched dependency state.
-          - \`debian/changelog\` bumped to \`${NEW_VER}-1\`.
-          - Trixie/MSRV quilt patch re-evaluated (see CI output).
+          | Item | Changed |
+          |------|---------|
+          | \`Cargo.toml\` | ${CARGO_TOML_CHANGED} |
+          | \`Cargo.lock\` / dependency set | ${CARGO_LOCK_CHANGED} |
+          | Trixie/MSRV quilt patch | status: ${PATCH_STATUS} |
+
+          See the [CI run for branch \`${BRANCH}\`](../actions) for the full dependency diff and patch evaluation output.
 
           ### Review checklist
 
-          - [ ] Upstream release notes reviewed
-          - [ ] Dependency changes acceptable
-          - [ ] Quilt patch status confirmed (applied / updated / dropped)
-          - [ ] CI passes
+          - [ ] Upstream release notes reviewed (see crates.io page above)
+          - [ ] Dependency changes acceptable (\`Cargo.lock\` diff in CI output)
+          - [ ] Quilt patch status confirmed (applied / updated / dropped as needed)
+          - [ ] License/copyright metadata reviewed if \`Cargo.toml\` changed
+          - [ ] CI passes on this branch
           - [ ] Package installs and smoke test passes${DRAFT_NOTE}
 
           ---
@@ -235,10 +281,10 @@ jobs:
   run-ci-on-update-branch:
     name: Run package CI on update branch
     needs: [check, prepare]
-    if: needs.check.outputs.update_available == 'true' || (github.event_name == 'workflow_dispatch' && github.event.inputs.force_version != '')
+    if: needs.check.outputs.update_available == 'true' && needs.prepare.outputs.branch != ''
     uses: ./.github/workflows/ci.yml
-    # The PR branch was just pushed; ci.yml listens on pull_request but
-    # GITHUB_TOKEN PRs don't trigger pull_request events from Actions.
-    # We therefore call ci.yml explicitly as a reusable workflow on the
-    # update branch so the same checks run before the PR can be merged.
+    with:
+      # Pass the exact commit SHA of the prepared update branch so package CI
+      # checks the precise state placed in the update PR — not the caller's rev.
+      ref: ${{ needs.prepare.outputs.commit_sha }}
     secrets: inherit

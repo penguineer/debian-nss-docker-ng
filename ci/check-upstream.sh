@@ -15,6 +15,11 @@
 #   1  — hard error (API failure, parse error, yanked/malformed release)
 #
 # The script does NOT modify the repository; that is done by prepare-update.sh.
+#
+# Sourcing guard: when CHECK_UPSTREAM_SOURCED=1 is set in the environment,
+# this script only defines its helper functions and returns without executing
+# the main logic.  Tests use this to import semver_gt and is_prerelease
+# directly from the production implementation.
 set -euo pipefail
 
 CRATE_NAME="nss-docker-ng"
@@ -36,6 +41,9 @@ is_prerelease() {
     # pre-release separator such as -rc1, .alpha2, etc.
     echo "$1" | grep -qiE '(alpha|beta|rc|pre(view)?)[._\-]?[0-9]*$'
 }
+
+# Return early if sourced for helper functions only (used by tests)
+[ "${CHECK_UPSTREAM_SOURCED:-}" = "1" ] && return 0
 
 # ── determine current packaged version ───────────────────────────────────────
 
