@@ -205,40 +205,49 @@ before upload.
 
 ```
 Depends: ${misc:Depends}, ${shlibs:Depends}
-Suggests: docker.io
 ```
 
-The plugin communicates with the Docker daemon over its Unix socket. The socket path
-differs by Docker source: `/run/docker.sock` is used by packages from the Docker Inc.
-repository, while `docker.io` from Debian may also use `/var/run/docker.sock`. Both
-paths are typically symlinked together on current systems, but this should be verified
-at runtime. There is no hard `Depends` on a Docker package: the plugin is non-functional
-without a running Docker daemon, but installation must not require Docker.
+The plugin communicates with the Docker daemon via the Unix socket at
+`/var/run/docker.sock` (upstream hardcodes this path). On current Debian and Docker CE
+systems `/var/run` maps to `/run`, so the socket is available as both
+`/var/run/docker.sock` and `/run/docker.sock` regardless of whether Docker was installed
+from the Debian archive (`docker.io`) or from the Docker Inc. repository (Docker CE).
+No package-level socket handling is therefore needed.
+
+There is no hard `Depends` on a Docker package: the plugin is non-functional without a
+running Docker daemon, but installation must not require Docker. `Suggests: docker.io`
+is omitted to remain neutral between Docker distributions.
 
 ---
 
 ## NSS Library Installation Path
 
+The installed file layout follows the upstream `debian/` packaging:
+
+- `libnss_docker_ng.so` — the ELF shared library (SONAME set to `libnss_docker_ng.so.2`
+  by `patchelf`); this is the file loaded by glibc at runtime
+- `libnss_docker_ng.so.2` — a symlink pointing to `libnss_docker_ng.so`
+
+Both are installed into:
 ```
-/usr/lib/$(DEB_HOST_MULTIARCH)/libnss_docker_ng.so.2
+/usr/lib/$(DEB_HOST_MULTIARCH)/
 ```
 
-with a symlink:
-
-```
-/usr/lib/$(DEB_HOST_MULTIARCH)/libnss_docker_ng.so -> libnss_docker_ng.so.2
-```
+This layout is intentional: the `.so.2` versioned name is what glibc looks up from the
+`nsswitch.conf` service name `docker_ng`, and the SONAME embedded in the ELF header
+ensures `ldconfig` maps it correctly. The symlink points back to the actual file.
 
 `ldconfig` cache is managed via the `shlibs` trigger, automatically handled by
 debhelper for libraries installed under `/usr/lib`.
 
-The NSS service name `docker_ng` in `nsswitch.conf` resolves to
-`libnss_docker_ng.so.2` at runtime, dictated by the upstream crate's
-`[lib] name = "nss_docker_ng"`.
-
-This matches the upstream `debian/install`:
+This matches the upstream `debian/install` and `debian/rules`:
 ```
+# debian/install
 target/release/libnss_docker_ng.so* usr/lib/${DEB_HOST_MULTIARCH}
+
+# debian/rules (build step)
+patchelf --set-soname libnss_docker_ng.so.2 ./target/release/libnss_docker_ng.so
+ln -s libnss_docker_ng.so ./target/release/libnss_docker_ng.so.2
 ```
 
 ---
