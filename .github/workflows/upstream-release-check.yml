@@ -19,6 +19,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  issues: write
 
 jobs:
   check:
@@ -74,6 +75,79 @@ jobs:
           echo "Current version:  ${{ steps.check.outputs.current_version }}"
           echo "Upstream version: ${{ steps.check.outputs.upstream_version }}"
           echo "Update available: ${{ steps.check.outputs.update_available }}"
+
+      - name: Reconcile open upstream-update PRs against crates.io yanked state
+        # For each open automation-created upstream-update/X.Y.Z PR, verify that
+        # its crates.io version is still non-yanked.  If it has been yanked, post
+        # a warning comment and add a "yanked-upstream" label so the PR is clearly
+        # flagged.  Unrelated manually-created PRs are never touched.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CRATE_NAME: nss-docker-ng
+          USER_AGENT: "debian-nss-docker-ng-updater/1 (https://github.com/penguineer/debian-nss-docker-ng)"
+        run: |
+          set -euo pipefail
+
+          # Fetch all crates.io versions once to avoid per-PR API calls
+          VERSIONS_JSON=$(curl --silent --fail \
+            --max-time 30 --retry 3 --retry-delay 5 \
+            --user-agent "$USER_AGENT" \
+            "https://crates.io/api/v1/crates/${CRATE_NAME}/versions") \
+            || { echo "WARNING: crates.io API unavailable; skipping reconciliation" >&2; exit 0; }
+
+          # List open PRs whose branch name starts with upstream-update/
+          OPEN_UPDATE_PRS=$(gh pr list \
+            --state open \
+            --json number,title,headRefName,labels \
+            --jq '[.[] | select(.headRefName | startswith("upstream-update/"))]')
+
+          echo "$OPEN_UPDATE_PRS" | jq -r '.[] | "\(.number) \(.headRefName)"' | \
+          while IFS=' ' read -r PR_NUM BRANCH; do
+            # Extract version from branch name: upstream-update/X.Y.Z
+            PR_VERSION="${BRANCH#upstream-update/}"
+            if [ -z "$PR_VERSION" ]; then
+              echo "PR #$PR_NUM: could not extract version from branch $BRANCH — skipping"
+              continue
+            fi
+
+            # Check yanked state for this version
+            YANKED=$(echo "$VERSIONS_JSON" | jq -r \
+              --arg ver "$PR_VERSION" \
+              '.versions | map(select(.num == $ver)) | first | .yanked // "unknown"')
+
+            if [ "$YANKED" = "true" ]; then
+              echo "PR #$PR_NUM (${PR_VERSION}): version is YANKED on crates.io — flagging"
+
+              # Add label (create it if missing)
+              gh label create "yanked-upstream" \
+                --color "e11d48" \
+                --description "Target upstream version has been yanked from crates.io" \
+                2>/dev/null || true
+              gh pr edit "$PR_NUM" --add-label "yanked-upstream" || true
+
+              # Check whether we already posted a warning on this PR
+              ALREADY_WARNED=$(gh pr view "$PR_NUM" \
+                --json comments \
+                --jq '[.comments[].body | select(contains("yanked on crates.io"))] | length')
+
+              if [ "${ALREADY_WARNED:-0}" -eq 0 ]; then
+                COMMENT_BODY="⚠️ **Upstream version \`${PR_VERSION}\` has been yanked on crates.io.**"
+                COMMENT_BODY="${COMMENT_BODY}"$'\n\n'
+                COMMENT_BODY="${COMMENT_BODY}This PR was created by the automated upstream-release-check workflow,"
+                COMMENT_BODY="${COMMENT_BODY} but the upstream release it tracks (\`${PR_VERSION}\`) is no longer"
+                COMMENT_BODY="${COMMENT_BODY} available as a stable, non-yanked release on crates.io."
+                COMMENT_BODY="${COMMENT_BODY}"$'\n\n'
+                COMMENT_BODY="${COMMENT_BODY}Please review and close this PR if the upstream release has been"
+                COMMENT_BODY="${COMMENT_BODY} permanently withdrawn, or wait for a corrected upstream release before merging."
+                gh pr comment "$PR_NUM" --body "$COMMENT_BODY"
+              fi
+
+            elif [ "$YANKED" = "unknown" ]; then
+              echo "PR #$PR_NUM (${PR_VERSION}): version not found on crates.io — skipping (may be a manual branch)"
+            else
+              echo "PR #$PR_NUM (${PR_VERSION}): version still non-yanked — OK"
+            fi
+          done
 
   prepare:
     name: Prepare update PR
@@ -144,8 +218,6 @@ jobs:
         if: steps.pr_check.outputs.skip != 'true'
         id: prepare
         env:
-          DEBEMAIL: "github-actions[bot]@users.noreply.github.com"
-          DEBFULLNAME: "github-actions[bot]"
           # Use the Trixie CI image for cargo vendor so the vendor archive is
           # built with the same Rust toolchain the Debian package build uses.
           TRIXIE_IMAGE: trixie-ci:latest
@@ -155,6 +227,13 @@ jobs:
           BRANCH="upstream-update/${NEW_VER}"
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # dch maintainer identity: read from debian/control (package owner),
+          # not the GitHub Actions bot, so changelog entries are attributed to
+          # the established package maintainer.
+          MAINTAINER=$(grep -m1 '^Maintainer:' debian/control | sed 's/^Maintainer: *//')
+          export DEBFULLNAME="${MAINTAINER% <*}"
+          export DEBEMAIL="${MAINTAINER##*<}"; DEBEMAIL="${DEBEMAIL%>}"
 
           git checkout -b "$BRANCH"
 

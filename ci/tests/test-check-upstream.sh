@@ -348,6 +348,55 @@ DRAFT_FLAG=$(echo "$DRAFT_OUT" | grep '^DRAFT_PR=' | cut -d= -f2 | tail -1)
     && pass "DRAFT_PR=true when patch does not apply" \
     || fail "DRAFT_PR should be true when patch fails (got '$DRAFT_FLAG')"
 
+# ── Trixie-image vendoring integration test ───────────────────────────────────
+# Runs only when TRIXIE_IMAGE is set and Docker is available (e.g., in
+# updater-tests.yml after building trixie-ci:latest).  In environments without
+# Docker the block is skipped with a note rather than a failure.
+echo ""
+echo "--- Trixie-image vendoring (TRIXIE_IMAGE=${TRIXIE_IMAGE:-<not set>}) ---"
+
+if [ -z "${TRIXIE_IMAGE:-}" ] || ! command -v docker >/dev/null 2>&1; then
+    echo "  (skipped: TRIXIE_IMAGE not set or docker not available)"
+else
+    TRIXIE_REPO="${TMPDIR_BASE}/trixie-repo"
+    make_test_repo "$TRIXIE_REPO"
+
+    TRIXIE_OUT_FILE="${TMPDIR_BASE}/trixie-prepare.out"
+    TRIXIE_EXIT=0
+    DEBEMAIL="test@test" DEBFULLNAME="Test" \
+        bash "$PREPARE_SCRIPT" \
+            --repo-root "$TRIXIE_REPO" \
+            "$FAKE_VERSION" "file://$FAKE_ARCHIVE" "$FAKE_CHECKSUM" \
+        > "$TRIXIE_OUT_FILE" 2>&1 || TRIXIE_EXIT=$?
+
+    if [ "$TRIXIE_EXIT" -eq 0 ]; then
+        pass "Trixie-image prepare-update.sh exited 0"
+    else
+        echo "  prepare-update.sh output:"
+        cat "$TRIXIE_OUT_FILE"
+        fail "Trixie-image prepare-update.sh exited non-zero ($TRIXIE_EXIT)"
+    fi
+
+    TVTGZ="$TRIXIE_REPO/vendor.tar.gz"
+    if [ -f "$TVTGZ" ]; then
+        TVLIST=$(tar tzf "$TVTGZ" 2>/dev/null)
+        T_CARGO=$(echo "$TVLIST" | grep -c '\.cargo/config\.toml' || true)
+        T_VENDOR=$(echo "$TVLIST" | grep -c '^vendor/' || true)
+        T_LOCK=$(echo "$TVLIST" | grep -c 'Cargo\.lock' || true)
+        [ "$T_CARGO" -ge 1 ] \
+            && pass "Trixie vendor.tar.gz contains .cargo/config.toml" \
+            || fail "Trixie vendor.tar.gz missing .cargo/config.toml"
+        [ "$T_VENDOR" -ge 1 ] \
+            && pass "Trixie vendor.tar.gz contains vendor/" \
+            || fail "Trixie vendor.tar.gz missing vendor/"
+        [ "$T_LOCK" -eq 0 ] \
+            && pass "Trixie vendor.tar.gz does not contain Cargo.lock" \
+            || fail "Trixie vendor.tar.gz must not contain Cargo.lock"
+    else
+        fail "Trixie vendor.tar.gz not created"
+    fi
+fi
+
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "════════════════════════════════════════════"

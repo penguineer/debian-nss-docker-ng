@@ -29,8 +29,28 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y devscripts
 
+      - name: Set up Docker BuildKit
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute APT_WEEK for CI image cache
+        run: echo "APT_WEEK=$(date -u +%G-W%V)" >> "$GITHUB_ENV"
+
+      - name: Build Trixie CI image
+        uses: docker/build-push-action@v6
+        with:
+          context: ci
+          file: ci/Dockerfile
+          push: false
+          load: true
+          tags: trixie-ci:latest
+          build-args: APT_WEEK=${{ env.APT_WEEK }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
       - name: Make scripts executable
         run: chmod +x ci/check-upstream.sh ci/prepare-update.sh ci/tests/test-check-upstream.sh
 
       - name: Run updater tests
+        env:
+          TRIXIE_IMAGE: trixie-ci:latest
         run: bash ci/tests/test-check-upstream.sh
