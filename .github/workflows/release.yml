@@ -52,8 +52,10 @@ jobs:
 
       - name: Run version consistency check
         id: versions
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          bash ci/check-release-version.sh "${{ github.ref_name }}" | tee /tmp/release-version-check.txt
+          bash ci/check-release-version.sh "$RELEASE_TAG" | tee /tmp/release-version-check.txt
           # Export versions for downstream jobs from the script's machine-readable output
           DEB_VER=$(grep '^DEB_VERSION=' /tmp/release-version-check.txt | cut -d= -f2)
           UPSTREAM_VER=$(grep '^UPSTREAM_VERSION=' /tmp/release-version-check.txt | cut -d= -f2)
