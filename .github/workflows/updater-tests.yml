@@ -48,9 +48,16 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Make scripts executable
-        run: chmod +x ci/check-upstream.sh ci/prepare-update.sh ci/tests/test-check-upstream.sh
+        run: |
+          chmod +x ci/check-upstream.sh ci/prepare-update.sh \
+            ci/check-release-version.sh \
+            ci/tests/test-check-upstream.sh \
+            ci/tests/test-check-release-version.sh
 
       - name: Run updater tests
         env:
           TRIXIE_IMAGE: trixie-ci:latest
         run: bash ci/tests/test-check-upstream.sh
+
+      - name: Run release version tests
+        run: bash ci/tests/test-check-release-version.sh

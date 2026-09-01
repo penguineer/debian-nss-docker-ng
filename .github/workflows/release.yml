@@ -1,0 +1,184 @@
+---
+name: Release
+
+# Triggered by tags of the form debian/<version> (e.g. debian/1.2.1-1).
+# The tag is the explicit human release approval boundary.  Everything after
+# a valid tag is pushed is automated: version checks, package build, validation,
+# checksum generation, and GitHub Release publication.
+on:
+  push:
+    tags:
+      - "debian/*"
+
+permissions:
+  contents: write  # Required to create a GitHub Release
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────── #
+  # 1. Version consistency check                                               #
+  #    Validates tag form, changelog version, and upstream version before any  #
+  #    build work begins.  Fails fast on any inconsistency.                   #
+  # ────────────────────────────────────────────────────────────────────────── #
+  version-check:
+    name: Verify version consistency
+    runs-on: ubuntu-latest
+    outputs:
+      deb_version: ${{ steps.versions.outputs.deb_version }}
+      upstream_version: ${{ steps.versions.outputs.upstream_version }}
+
+    steps:
+      - name: Check out tagged commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Run version consistency check
+        id: versions
+        run: |
+          bash ci/check-release-version.sh "${{ github.ref_name }}" | tee /tmp/release-version-check.txt
+          # Export versions for downstream jobs from the script's machine-readable output
+          DEB_VER=$(grep '^DEB_VERSION=' /tmp/release-version-check.txt | cut -d= -f2)
+          UPSTREAM_VER=$(grep '^UPSTREAM_VERSION=' /tmp/release-version-check.txt | cut -d= -f2)
+          echo "deb_version=${DEB_VER}"           >> "$GITHUB_OUTPUT"
+          echo "upstream_version=${UPSTREAM_VER}" >> "$GITHUB_OUTPUT"
+
+  # ────────────────────────────────────────────────────────────────────────── #
+  # 2. Package build and validation                                            #
+  #    Reuses the same CI workflow that validates every push to main.         #
+  #    The release job builds from the exact tagged commit.                   #
+  #    Artifacts are retained only here in the release path.                  #
+  # ────────────────────────────────────────────────────────────────────────── #
+  build-and-validate:
+    name: Build and validate package
+    needs: version-check
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ github.ref }}
+
+  # ────────────────────────────────────────────────────────────────────────── #
+  # 3. Collect artifacts, compute checksums, publish GitHub Release            #
+  # ────────────────────────────────────────────────────────────────────────── #
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - version-check
+      - build-and-validate
+    runs-on: ubuntu-latest
+    env:
+      DEB_VERSION: ${{ needs.version-check.outputs.deb_version }}
+
+    steps:
+      - name: Check out tagged commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Set up Docker BuildKit
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute APT_WEEK for CI image cache
+        run: echo "APT_WEEK=$(date -u +%G-W%V)" >> "$GITHUB_ENV"
+
+      - name: Build Trixie CI image
+        uses: docker/build-push-action@v6
+        with:
+          context: ci
+          file: ci/Dockerfile
+          push: false
+          load: true
+          tags: trixie-ci:latest
+          build-args: APT_WEEK=${{ env.APT_WEEK }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Build the package a second time to produce artifacts in the publish job.
+      # The build-and-validate job (job 2) has already confirmed that a clean
+      # build succeeds for this exact tagged commit, so this second build
+      # produces equivalent artifacts under the same reproducible source state.
+      - name: Build Debian package
+        run: |
+          PARENT=$(dirname "${{ github.workspace }}")
+          SRCDIR=$(basename "${{ github.workspace }}")
+          docker run --rm \
+            --volume "$PARENT":/build \
+            --workdir "/build/$SRCDIR" \
+            trixie-ci:latest \
+            bash "ci/build-package.sh"
+
+      - name: Re-run package validation
+        run: |
+          ARTIFACTS=$(dirname "${{ github.workspace }}")
+          docker run --rm \
+            --volume "$ARTIFACTS":/artifacts \
+            --volume "${{ github.workspace }}/ci":/ci:ro \
+            trixie-ci:latest \
+            bash /ci/check-package.sh /artifacts
+
+      - name: Collect release artifacts
+        run: |
+          ARTIFACTS_SRC=$(dirname "${{ github.workspace }}")
+          RELEASE_DIR="${{ github.workspace }}/release-artifacts"
+          mkdir -p "$RELEASE_DIR"
+
+          # Copy all Debian build outputs.  dpkg-buildpackage -b produces:
+          #   libnss-docker-ng_<ver>_<arch>.deb
+          #   libnss-docker-ng_<ver>_<arch>.buildinfo
+          #   nss-docker-ng_<ver>_<arch>.changes
+          #
+          # .dsc and orig.tar.gz are not produced for binary-only (-b) builds.
+          # These are all the genuine build outputs for this packaging model.
+          cp "$ARTIFACTS_SRC"/libnss-docker-ng_*.deb \
+             "$ARTIFACTS_SRC"/*.buildinfo \
+             "$ARTIFACTS_SRC"/*.changes \
+             "$RELEASE_DIR/"
+
+          echo "=== Release artifacts ==="
+          ls -lh "$RELEASE_DIR/"
+
+      - name: Generate SHA-256 checksums
+        run: |
+          RELEASE_DIR="${{ github.workspace }}/release-artifacts"
+          cd "$RELEASE_DIR"
+          sha256sum ./* > SHA256SUMS
+          echo ""
+          echo "=== SHA256SUMS ==="
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RELEASE_DIR="${{ github.workspace }}/release-artifacts"
+          TAG="${{ github.ref_name }}"
+          DEB_VER="${{ env.DEB_VERSION }}"
+
+          NOTES_FILE="$(mktemp /tmp/release-notes.XXXXXX.md)"
+          {
+            echo "## libnss-docker-ng ${DEB_VER}"
+            echo ""
+            echo "Debian package for [nss-docker-ng](https://github.com/petski/nss-docker-ng)."
+            echo ""
+            echo "### Artifacts"
+            echo ""
+            echo "| File | Description |"
+            echo "|------|-------------|"
+            echo "| \`libnss-docker-ng_*.deb\` | Installable Debian package (amd64) |"
+            echo "| \`*.buildinfo\` | Reproducibility record: build environment and checksums |"
+            echo "| \`*.changes\` | Package upload/metadata summary |"
+            echo "| \`SHA256SUMS\` | SHA-256 checksums for all downloadable artifacts |"
+            echo ""
+            echo "### Install"
+            echo ""
+            echo "\`\`\`sh"
+            echo "# Verify checksum (recommended)"
+            echo "sha256sum --check --ignore-missing SHA256SUMS"
+            echo ""
+            echo "# Install"
+            echo "sudo apt install ./libnss-docker-ng_${DEB_VER}_*.deb"
+            echo "\`\`\`"
+          } > "$NOTES_FILE"
+
+          gh release create "$TAG" \
+            --title "libnss-docker-ng ${DEB_VER}" \
+            --notes-file "$NOTES_FILE" \
+            "$RELEASE_DIR"/*
