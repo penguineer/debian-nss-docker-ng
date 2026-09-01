@@ -11,7 +11,7 @@ on:
       - "debian/*"
 
 permissions:
-  contents: write  # Required to create a GitHub Release
+  contents: read
 
 jobs:
   # ────────────────────────────────────────────────────────────────────────── #
@@ -84,6 +84,8 @@ jobs:
       - version-check
       - build-and-validate
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Required to create a GitHub Release
     env:
       DEB_VERSION: ${{ needs.version-check.outputs.deb_version }}
 
