@@ -18,6 +18,8 @@ jobs:
   # 1. Version consistency check                                               #
   #    Validates tag form, changelog version, and upstream version before any  #
   #    build work begins.  Fails fast on any inconsistency.                   #
+  #    Also verifies that the tagged commit is reachable from origin/main,    #
+  #    ensuring only reviewed repository state can be released.               #
   # ────────────────────────────────────────────────────────────────────────── #
   version-check:
     name: Verify version consistency
@@ -31,6 +33,20 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
+          # Fetch full history so we can verify ancestry against origin/main.
+          fetch-depth: 0
+
+      - name: Verify tagged commit is reachable from origin/main
+        env:
+          TAGGED_SHA: ${{ github.sha }}
+        run: |
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$TAGGED_SHA" origin/main; then
+            echo "ERROR: Tagged commit $TAGGED_SHA is not reachable from origin/main." >&2
+            echo "Release tags must be placed on commits that have been merged to main." >&2
+            exit 1
+          fi
+          echo "Ancestry check PASSED: $TAGGED_SHA is reachable from origin/main."
 
       - name: Run version consistency check
         id: versions
@@ -43,10 +59,12 @@ jobs:
           echo "upstream_version=${UPSTREAM_VER}" >> "$GITHUB_OUTPUT"
 
   # ────────────────────────────────────────────────────────────────────────── #
-  # 2. Package build and validation                                            #
+  # 2. Package build and full validation                                       #
   #    Reuses the same CI workflow that validates every push to main.         #
-  #    The release job builds from the exact tagged commit.                   #
-  #    Artifacts are retained only here in the release path.                  #
+  #    upload-artifacts=true causes ci.yml to retain the Debian build outputs #
+  #    under the artifact name "debian-packages", which the publish job then  #
+  #    downloads directly.  This ensures the exact validated .deb is          #
+  #    published — not a second build.                                        #
   # ────────────────────────────────────────────────────────────────────────── #
   build-and-validate:
     name: Build and validate package
@@ -54,9 +72,11 @@ jobs:
     uses: ./.github/workflows/ci.yml
     with:
       ref: ${{ github.ref }}
+      upload-artifacts: true
 
   # ────────────────────────────────────────────────────────────────────────── #
-  # 3. Collect artifacts, compute checksums, publish GitHub Release            #
+  # 3. Compute checksums and publish GitHub Release                            #
+  #    Downloads the exact artifacts produced and validated by job 2.         #
   # ────────────────────────────────────────────────────────────────────────── #
   publish:
     name: Publish GitHub Release
@@ -68,77 +88,20 @@ jobs:
       DEB_VERSION: ${{ needs.version-check.outputs.deb_version }}
 
     steps:
-      - name: Check out tagged commit
-        uses: actions/checkout@v4
+      - name: Download validated Debian build artifacts
+        uses: actions/download-artifact@v4
         with:
-          ref: ${{ github.ref }}
+          name: debian-packages
+          path: release-artifacts
 
-      - name: Set up Docker BuildKit
-        uses: docker/setup-buildx-action@v3
-
-      - name: Compute APT_WEEK for CI image cache
-        run: echo "APT_WEEK=$(date -u +%G-W%V)" >> "$GITHUB_ENV"
-
-      - name: Build Trixie CI image
-        uses: docker/build-push-action@v6
-        with:
-          context: ci
-          file: ci/Dockerfile
-          push: false
-          load: true
-          tags: trixie-ci:latest
-          build-args: APT_WEEK=${{ env.APT_WEEK }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      # Build the package a second time to produce artifacts in the publish job.
-      # The build-and-validate job (job 2) has already confirmed that a clean
-      # build succeeds for this exact tagged commit, so this second build
-      # produces equivalent artifacts under the same reproducible source state.
-      - name: Build Debian package
+      - name: List release artifacts
         run: |
-          PARENT=$(dirname "${{ github.workspace }}")
-          SRCDIR=$(basename "${{ github.workspace }}")
-          docker run --rm \
-            --volume "$PARENT":/build \
-            --workdir "/build/$SRCDIR" \
-            trixie-ci:latest \
-            bash "ci/build-package.sh"
-
-      - name: Re-run package validation
-        run: |
-          ARTIFACTS=$(dirname "${{ github.workspace }}")
-          docker run --rm \
-            --volume "$ARTIFACTS":/artifacts \
-            --volume "${{ github.workspace }}/ci":/ci:ro \
-            trixie-ci:latest \
-            bash /ci/check-package.sh /artifacts
-
-      - name: Collect release artifacts
-        run: |
-          ARTIFACTS_SRC=$(dirname "${{ github.workspace }}")
-          RELEASE_DIR="${{ github.workspace }}/release-artifacts"
-          mkdir -p "$RELEASE_DIR"
-
-          # Copy all Debian build outputs.  dpkg-buildpackage -b produces:
-          #   libnss-docker-ng_<ver>_<arch>.deb
-          #   libnss-docker-ng_<ver>_<arch>.buildinfo
-          #   nss-docker-ng_<ver>_<arch>.changes
-          #
-          # .dsc and orig.tar.gz are not produced for binary-only (-b) builds.
-          # These are all the genuine build outputs for this packaging model.
-          cp "$ARTIFACTS_SRC"/libnss-docker-ng_*.deb \
-             "$ARTIFACTS_SRC"/*.buildinfo \
-             "$ARTIFACTS_SRC"/*.changes \
-             "$RELEASE_DIR/"
-
           echo "=== Release artifacts ==="
-          ls -lh "$RELEASE_DIR/"
+          ls -lh release-artifacts/
 
       - name: Generate SHA-256 checksums
         run: |
-          RELEASE_DIR="${{ github.workspace }}/release-artifacts"
-          cd "$RELEASE_DIR"
+          cd release-artifacts
           sha256sum ./* > SHA256SUMS
           echo ""
           echo "=== SHA256SUMS ==="
@@ -148,7 +111,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          RELEASE_DIR="${{ github.workspace }}/release-artifacts"
+          RELEASE_DIR="release-artifacts"
           TAG="${{ github.ref_name }}"
           DEB_VER="${{ env.DEB_VERSION }}"
 

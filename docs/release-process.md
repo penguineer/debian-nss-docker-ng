@@ -56,7 +56,8 @@ packaging-only changes.  A future packaging fix is released as:
 Before pushing a release tag:
 
 1. **The tagged commit is on `main` and has been reviewed.**  The workflow
-   does not build from unreviewed branches or PRs.
+   enforces this: it verifies that the tagged commit is an ancestor of
+   `origin/main` and fails before building if the check does not pass.
 2. **`debian/changelog` has been updated** with a new entry for the version
    being released.
 3. **`Cargo.toml` version** matches the upstream portion of the Debian
@@ -129,9 +130,9 @@ Before publishing, the workflow runs:
 
 | Check | What it verifies |
 |-------|-----------------|
+| `git merge-base --is-ancestor` | Tagged commit is reachable from `origin/main` |
 | `ci/check-release-version.sh` | Tag form, tag↔changelog match, changelog↔Cargo.toml upstream version match |
 | CI workflow (reused) | Trixie build, lintian, install/removal lifecycle, Docker NSS smoke test |
-| Package re-validation | `ci/check-package.sh` runs again on the artifacts being published |
 
 ---
 
