@@ -1,0 +1,180 @@
+---
+name: Release
+
+# Triggered by tags of the form debian/<version> (e.g. debian/1.2.1-1).
+# The tag is the explicit human release approval boundary.  Everything after
+# a valid tag is pushed is automated: version checks, package build, validation,
+# checksum generation, and GitHub Release publication.
+on:
+  push:
+    tags:
+      - "debian/*"
+
+permissions:
+  contents: read
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────── #
+  # 1. Version consistency check                                               #
+  #    Validates tag form, changelog version, and upstream version before any  #
+  #    build work begins.  Fails fast on any inconsistency.                   #
+  #    Also verifies that the tagged commit is reachable from origin/main,    #
+  #    ensuring only reviewed repository state can be released.               #
+  # ────────────────────────────────────────────────────────────────────────── #
+  version-check:
+    name: Verify version consistency
+    runs-on: ubuntu-latest
+    outputs:
+      deb_version: ${{ steps.versions.outputs.deb_version }}
+      upstream_version: ${{ steps.versions.outputs.upstream_version }}
+
+    steps:
+      # Use the immutable triggering commit SHA, not the tag ref, to avoid a
+      # TOCTOU race if the tag is moved after the workflow is triggered.
+      - name: Check out triggering commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          # Fetch full history so we can verify ancestry against origin/main.
+          fetch-depth: 0
+
+      - name: Verify tagged commit is reachable from origin/main
+        env:
+          TAGGED_SHA: ${{ github.sha }}
+        run: |
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$TAGGED_SHA" origin/main; then
+            echo "ERROR: Tagged commit $TAGGED_SHA is not reachable from origin/main." >&2
+            echo "Release tags must be placed on commits that have been merged to main." >&2
+            exit 1
+          fi
+          echo "Ancestry check PASSED: $TAGGED_SHA is reachable from origin/main."
+
+      - name: Run version consistency check
+        id: versions
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          bash ci/check-release-version.sh "$RELEASE_TAG" | tee /tmp/release-version-check.txt
+          # Export versions for downstream jobs from the script's machine-readable output
+          DEB_VER=$(grep '^DEB_VERSION=' /tmp/release-version-check.txt | cut -d= -f2)
+          UPSTREAM_VER=$(grep '^UPSTREAM_VERSION=' /tmp/release-version-check.txt | cut -d= -f2)
+          echo "deb_version=${DEB_VER}"           >> "$GITHUB_OUTPUT"
+          echo "upstream_version=${UPSTREAM_VER}" >> "$GITHUB_OUTPUT"
+
+  # ────────────────────────────────────────────────────────────────────────── #
+  # 2. Package build and full validation                                       #
+  #    Reuses the same CI workflow that validates every push to main.         #
+  #    The immutable triggering SHA is passed so the build always corresponds #
+  #    to the commit that was validated above — not wherever the tag points   #
+  #    at build time.                                                          #
+  #    upload-artifacts=true causes ci.yml to retain the Debian build outputs #
+  #    under the artifact name "debian-packages", which the publish job then  #
+  #    downloads directly.  This ensures the exact validated .deb is          #
+  #    published — not a second build.                                        #
+  # ────────────────────────────────────────────────────────────────────────── #
+  build-and-validate:
+    name: Build and validate package
+    needs: version-check
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ github.sha }}
+      upload-artifacts: true
+
+  # ────────────────────────────────────────────────────────────────────────── #
+  # 3. Compute checksums and publish GitHub Release                            #
+  #    Downloads the exact artifacts produced and validated by job 2.         #
+  # ────────────────────────────────────────────────────────────────────────── #
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - version-check
+      - build-and-validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Required to create a GitHub Release
+    env:
+      DEB_VERSION: ${{ needs.version-check.outputs.deb_version }}
+
+    steps:
+      - name: Download validated Debian build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: debian-packages
+          path: release-artifacts
+
+      - name: List release artifacts
+        run: |
+          echo "=== Release artifacts ==="
+          ls -lh release-artifacts/
+
+      - name: Generate SHA-256 checksums
+        run: |
+          cd release-artifacts
+          sha256sum ./* > SHA256SUMS
+          echo ""
+          echo "=== SHA256SUMS ==="
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAGGED_SHA: ${{ github.sha }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          RELEASE_DIR="release-artifacts"
+          DEB_VER="${{ env.DEB_VERSION }}"
+
+          # Verify that the release tag still resolves to the exact commit that
+          # triggered this workflow.  Fail rather than publish if the tag has
+          # been moved or deleted since the workflow started.
+          REMOTE_SHA=$(git ls-remote --tags "https://github.com/${GH_REPO}.git" \
+                         "refs/tags/${TAG_NAME}" | awk '{print $1}')
+          # Resolve annotated tag objects to the underlying commit
+          RESOLVED_SHA=$(git ls-remote --tags "https://github.com/${GH_REPO}.git" \
+                           "refs/tags/${TAG_NAME}^{}" | awk '{print $1}')
+          EFFECTIVE_SHA="${RESOLVED_SHA:-$REMOTE_SHA}"
+          if [ -z "$EFFECTIVE_SHA" ]; then
+            echo "ERROR: Release tag '${TAG_NAME}' no longer exists on the remote." >&2
+            exit 1
+          fi
+          if [ "$EFFECTIVE_SHA" != "$TAGGED_SHA" ]; then
+            echo "ERROR: Release tag '${TAG_NAME}' now points to ${EFFECTIVE_SHA}," >&2
+            echo "       but this workflow was triggered from ${TAGGED_SHA}." >&2
+            echo "       The tag may have been moved. Refusing to publish." >&2
+            exit 1
+          fi
+          echo "Tag integrity check PASSED: ${TAG_NAME} → ${EFFECTIVE_SHA}"
+
+          NOTES_FILE="$(mktemp /tmp/release-notes.XXXXXX.md)"
+          {
+            echo "## libnss-docker-ng ${DEB_VER}"
+            echo ""
+            echo "Debian package for [nss-docker-ng](https://github.com/petski/nss-docker-ng)."
+            echo ""
+            echo "### Artifacts"
+            echo ""
+            echo "| File | Description |"
+            echo "|------|-------------|"
+            echo "| \`libnss-docker-ng_*.deb\` | Installable Debian package (amd64) |"
+            echo "| \`*.buildinfo\` | Reproducibility record: build environment and checksums |"
+            echo "| \`*.changes\` | Package upload/metadata summary |"
+            echo "| \`SHA256SUMS\` | SHA-256 checksums for all downloadable artifacts |"
+            echo ""
+            echo "### Install"
+            echo ""
+            echo "\`\`\`sh"
+            echo "# Verify checksum (recommended)"
+            echo "sha256sum --check --ignore-missing SHA256SUMS"
+            echo ""
+            echo "# Install"
+            echo "sudo apt install ./libnss-docker-ng_${DEB_VER}_*.deb"
+            echo "\`\`\`"
+          } > "$NOTES_FILE"
+
+          gh release create "$TAG_NAME" \
+            --verify-tag \
+            --title "libnss-docker-ng ${DEB_VER}" \
+            --notes-file "$NOTES_FILE" \
+            "$RELEASE_DIR"/*

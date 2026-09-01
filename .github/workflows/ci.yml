@@ -13,6 +13,11 @@ on:
         required: false
         type: string
         default: ""
+      upload-artifacts:
+        description: "Upload Debian build artifacts after a successful build and validation."
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -134,3 +139,20 @@ jobs:
             trixie-ci:latest \
             bash /ci/smoke-test-nss.sh /artifacts "$TEST_NAME" "$CONTAINER_IP"
 
+      # ------------------------------------------------------------------ #
+      # 6. Upload build artifacts (release path only)                       #
+      #    Artifacts are retained only when upload-artifacts=true, which is #
+      #    set exclusively by the release workflow.  Ordinary PR/push CI    #
+      #    does not upload artifacts.                                       #
+      # ------------------------------------------------------------------ #
+      - name: Upload Debian build artifacts
+        if: inputs.upload-artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: debian-packages
+          path: |
+            ${{ runner.workspace }}/*.deb
+            ${{ runner.workspace }}/*.buildinfo
+            ${{ runner.workspace }}/*.changes
+          if-no-files-found: error
+          retention-days: 1
