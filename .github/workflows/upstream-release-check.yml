@@ -93,12 +93,12 @@ jobs:
     name: Reconcile yanked upstream-update PRs
     needs: check
     runs-on: ubuntu-latest
-    # pull-requests: write — to add the "yanked-upstream" label to open update PRs.
-    # issues: write — required by GitHub's permission model to post PR review comments
-    # and create labels via the gh CLI even though the target is a pull request.
+    # issues: write — required to post PR conversation comments (gh pr comment
+    # creates issue comments) and to create/add labels via gh label create and
+    # gh pr edit --add-label.  Pull-request listing/viewing needs only read access.
     permissions:
       contents: read
-      pull-requests: write
+      pull-requests: read
       issues: write
 
     steps:
