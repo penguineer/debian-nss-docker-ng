@@ -42,13 +42,18 @@ verify_installed_state() {
 
     echo ""
     echo "=== [$phase] Verifying docker_ng appears exactly once in hosts: ==="
-    local hosts_line
-    hosts_line=$(grep '^hosts:' /etc/nsswitch.conf)
     local count
-    count=$(echo "$hosts_line" | tr ' ' '\n' | grep -c '^docker_ng$' || true)
+    count=$(awk '
+        $1 == "hosts:" {
+            for (i = 2; i <= NF; i++)
+                if ($i == "docker_ng")
+                    count++
+        }
+        END { print count + 0 }
+    ' /etc/nsswitch.conf)
     if [ "$count" -ne 1 ]; then
         echo "FAIL: docker_ng appears $count time(s) in hosts: line (expected 1)."
-        echo "  hosts: [$hosts_line]"
+        echo "  hosts: [$(grep '^hosts:' /etc/nsswitch.conf || true)]"
         exit 1
     fi
     echo "$phase verification PASSED."
