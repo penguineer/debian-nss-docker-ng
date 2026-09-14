@@ -2,13 +2,12 @@
 # ci/prepare-update-branch.sh — Orchestrate update branch creation for a new upstream release.
 #
 # This script handles the git/branch layer that surrounds prepare-update.sh:
-#   1. Validate inputs (no existing PR for this version).
-#   2. Configure git identity (bot for commits, package maintainer for dch).
-#   3. Create the update branch.
-#   4. Invoke prepare-update.sh to update source files and vendor archive.
-#   5. Commit the changes.
-#   6. Push the branch.
-#   7. Emit GITHUB_OUTPUT variables for downstream workflow steps.
+#   1. Configure git identity (bot for commits, package maintainer for dch).
+#   2. Create the update branch.
+#   3. Invoke prepare-update.sh to update source files and vendor archive.
+#   4. Commit the changes.
+#   5. Push the branch.
+#   6. Emit GITHUB_OUTPUT variables for downstream workflow steps.
 #
 # This script does NOT create the GitHub PR — that is done by create-update-pr.sh.
 #

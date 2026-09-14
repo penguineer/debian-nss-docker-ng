@@ -476,6 +476,12 @@ tar -czf "$BRANCH_FAKE_ARCHIVE" \
     "nss-docker-ng-${BRANCH_FAKE_VERSION}"
 BRANCH_FAKE_CHECKSUM=$(sha256sum "$BRANCH_FAKE_ARCHIVE" | awk '{print $1}')
 
+# Capture real-checkout state before running the integration test.
+# If prepare-update-branch.sh ever regresses its repo-root isolation,
+# these will differ after the subshell completes and the test will fail.
+REAL_CHECKOUT_CARGO_BEFORE=$(sha256sum "$REPO_ROOT/Cargo.toml" | awk '{print $1}')
+REAL_CHECKOUT_SRC_BEFORE=$(sha256sum "$REPO_ROOT/src/lib.rs" | awk '{print $1}')
+
 BRANCH_EXIT=0
 (
     cd "$BRANCH_REPO"
@@ -509,13 +515,20 @@ EMITTED_BRANCH=$(grep '^branch=' "$BRANCH_OUTPUT_FILE" | cut -d= -f2)
     && pass "prepare-update-branch.sh: branch name is upstream-update/${BRANCH_FAKE_VERSION}" \
     || fail "prepare-update-branch.sh: wrong branch name (got '$EMITTED_BRANCH')"
 
-# Verify commit_sha is a full 40-char hex SHA
+# Verify commit_sha matches the actual prepared commit in the fixture repo
 EMITTED_SHA=$(grep '^commit_sha=' "$BRANCH_OUTPUT_FILE" | cut -d= -f2)
-if echo "$EMITTED_SHA" | grep -qE '^[0-9a-f]{40}$'; then
-    pass "prepare-update-branch.sh: commit_sha is a full 40-char hex SHA"
-else
-    fail "prepare-update-branch.sh: commit_sha looks wrong (got '$EMITTED_SHA')"
-fi
+EXPECTED_SHA=$(git -C "$BRANCH_REPO" rev-parse HEAD)
+[ "$EMITTED_SHA" = "$EXPECTED_SHA" ] \
+    && pass "prepare-update-branch.sh: commit_sha matches prepared fixture HEAD" \
+    || fail "prepare-update-branch.sh: emitted commit_sha does not match fixture HEAD (got '$EMITTED_SHA', expected '$EXPECTED_SHA')"
+
+# Verify real checkout was not touched by the integration test
+[ "$(sha256sum "$REPO_ROOT/Cargo.toml" | awk '{print $1}')" = "$REAL_CHECKOUT_CARGO_BEFORE" ] \
+    && pass "prepare-update-branch.sh: real-repo Cargo.toml unchanged (isolation)" \
+    || fail "prepare-update-branch.sh: real-repo Cargo.toml was modified (repo-root isolation regression)"
+[ "$(sha256sum "$REPO_ROOT/src/lib.rs" | awk '{print $1}')" = "$REAL_CHECKOUT_SRC_BEFORE" ] \
+    && pass "prepare-update-branch.sh: real-repo src/lib.rs unchanged (isolation)" \
+    || fail "prepare-update-branch.sh: real-repo src/lib.rs was modified (repo-root isolation regression)"
 
 # ── Test: checksum failure aborts before any modification ─────────────────────
 echo "--- Checksum failure aborts before modification ---"
