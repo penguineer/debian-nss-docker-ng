@@ -64,11 +64,12 @@ hosts before=dns,resolve docker_ng
 
 `dh_installnss` reads this policy and inserts `docker_ng` before `dns` and `resolve`
 on the `hosts:` line of `/etc/nsswitch.conf` at install time, while preserving all
-other services already present on that line. On removal it removes `docker_ng` and
-restores the line to its exact pre-install state.
+other services already present on that line. On removal it removes `docker_ng` while
+leaving other NSS services intact.
 
 The resulting `hosts:` line therefore depends on what was already configured on the
-system; it is not a fixed string.
+system; it is not a fixed string. The install/removal lifecycle CI verifies exact
+pre-install/post-removal equality in its controlled test environment.
 
 ## Usage
 
@@ -85,8 +86,8 @@ getent hosts my-container.docker
 sudo apt remove libnss-docker-ng
 ```
 
-`dh_installnss` removes the `docker_ng` entry from `/etc/nsswitch.conf` and restores
-the original line automatically. To additionally purge any leftover package state:
+`dh_installnss` removes the `docker_ng` entry from `/etc/nsswitch.conf` while
+leaving other NSS services intact. To additionally purge any leftover package state:
 
 ```bash
 sudo apt purge libnss-docker-ng
@@ -103,8 +104,8 @@ crates.io every Monday. When a new stable, non-yanked release is found, the work
 2. prepares an `upstream-update/<version>` branch with updated sources, a regenerated
    `vendor.tar.gz`, and a bumped `debian/changelog`,
 3. evaluates the Trixie/MSRV compatibility patch,
-4. runs the full package CI on the exact prepared commit, and
-5. opens a reviewable pull request (draft if patch review is required).
+4. opens a reviewable pull request (draft if patch review is required), and
+5. runs the full package CI on the exact prepared commit.
 
 No upstream update is merged or released automatically; human review is always required.
 

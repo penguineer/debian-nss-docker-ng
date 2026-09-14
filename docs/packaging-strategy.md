@@ -389,5 +389,6 @@ The initial `debian/` packaging for version `1.2.1-1` is implemented:
   dependency version caps applied in `Cargo.toml` to maintain `rustc 1.85` compatibility
 
 The package builds successfully and produces a correctly structured `.deb`. Upstream
-unit tests (`cargo test --offline`) run during `dh_auto_test` and pass. Maintainers
-regenerate `vendor.tar.gz` for each upstream version bump via `cargo vendor`.
+unit tests (`cargo test --offline`) run during `dh_auto_test` and pass. `vendor.tar.gz`
+is regenerated for each upstream version bump by `ci/prepare-update.sh` as part of
+the automated upstream-update PR workflow.

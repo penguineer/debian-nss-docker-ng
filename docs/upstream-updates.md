@@ -42,9 +42,8 @@ A yanked version is never prepared as an update.
 
 ## Preparation
 
-When a new valid upstream version is found, `ci/prepare-update.sh` performs the
-following steps inside the Debian Trixie CI container so that the result matches
-the authoritative build environment:
+When a new valid upstream version is found, `ci/prepare-update.sh` runs in the
+workflow checkout on the GitHub Actions runner and performs the following steps:
 
 1. **Download and verify** the upstream `.crate` archive (aborts on checksum mismatch).
 2. **Synchronise upstream source files** into the repository tree, preserving all
@@ -54,9 +53,11 @@ the authoritative build environment:
    - If it applies cleanly, it is kept and applied before vendoring.
    - If it does not apply, the script reports whether the patch may be obsolete or
      requires manual intervention.
-4. **Regenerate `vendor.tar.gz`** containing `.cargo/config.toml` and `vendor/`.
-   Vendor-local `Cargo.lock` files are excluded; the repository-root `Cargo.lock`
-   remains authoritative.
+4. **Regenerate `vendor.tar.gz`** — the `cargo vendor --locked` operation is run
+   inside the Trixie CI container (via `TRIXIE_IMAGE`) so that dependency resolution
+   uses the authoritative Rust toolchain. The archive contains `.cargo/config.toml`
+   and `vendor/`; vendor-local `Cargo.lock` files are excluded and the
+   repository-root `Cargo.lock` remains authoritative.
 5. **Update `debian/changelog`** with a new entry for the new upstream version.
 6. **Report** changes to `Cargo.toml`, `Cargo.lock`, and patch status.
 
@@ -78,10 +79,9 @@ If an open PR for the same version already exists (detected by
 
 ## Package CI on the prepared commit
 
-Immediately after the PR branch is pushed, the **Debian Package CI** workflow
-runs against the exact commit SHA of the prepared branch — not the caller's rev.
-This ensures the PR reflects the real build and test result before any human
-review begins.
+After the PR is created, the **Debian Package CI** workflow runs against the exact
+commit SHA of the prepared branch — not the caller's rev. This ensures the PR
+already reflects the real build and test result when a reviewer looks at it.
 
 ---
 
