@@ -1,27 +1,3 @@
-nss-docker-ng (88.0.0-1) unstable; urgency=low
-
-  * New upstream release 88.0.0 (was 88.0.0).
-
- -- Stefan Haun <tux@netz39.de>  Mon, 14 Sep 2026 17:20:24 +0000
-
-nss-docker-ng (88.0.0-1) unstable; urgency=low
-
-  * New upstream release 88.0.0 (was 88.0.0).
-
- -- Stefan Haun <tux@netz39.de>  Mon, 14 Sep 2026 17:20:16 +0000
-
-nss-docker-ng (88.0.0-1) unstable; urgency=low
-
-  * New upstream release 88.0.0 (was 88.0.0).
-
- -- Stefan Haun <tux@netz39.de>  Mon, 14 Sep 2026 17:19:47 +0000
-
-nss-docker-ng (88.0.0-1) unstable; urgency=low
-
-  * New upstream release 88.0.0 (was 1.2.1).
-
- -- Stefan Haun <tux@netz39.de>  Mon, 14 Sep 2026 17:19:25 +0000
-
 nss-docker-ng (1.2.1-1) unstable; urgency=low
 
   * Initial Debian package.
