@@ -12,9 +12,11 @@ DEB=$(ls "$ARTIFACTS_DIR"/libnss-docker-ng_*.deb | head -1)
 CHANGES=$(ls "$ARTIFACTS_DIR"/*.changes | head -1)
 
 echo "=== Lintian ==="
+# Failure policy: --fail-on error causes lintian to exit non-zero only for
+# error-level findings.  Warnings remain visible but non-fatal; this is
+# intentional so that expected NSS-module warnings do not block CI.
+#
 # Accepted findings are narrowly suppressed and documented:
-#   extended-description-is-empty: upstream summary is intentionally brief;
-#     not a packaging defect.
 #   package-name-doesnt-match-sonames: libnss-docker-ng ships libnss_docker_ng.so.2
 #     but is intentionally named without a SONAME version suffix.  This package
 #     implements the glibc NSS service interface, not a conventional shared library
@@ -24,10 +26,7 @@ echo "=== Lintian ==="
 #     naming.
 # *.dsc is intentionally omitted: the build is binary-only (-b) and
 # produces no source package.
-# lintian exits non-zero for any tag not suppressed, preserving failure
-# semantics while still allowing the accepted warnings.
 lintian \
-    --suppress-tags extended-description-is-empty \
     --suppress-tags package-name-doesnt-match-sonames \
     --fail-on error \
     "$DEB" "$CHANGES"
