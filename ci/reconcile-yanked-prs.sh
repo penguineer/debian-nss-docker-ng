@@ -73,6 +73,15 @@ decide_yanked_action() {
     esac
 }
 
+# Count how many comments in a gh-pr-view JSON response contain the
+# duplicate-warning sentinel string "yanked on crates.io".
+# Input: JSON string (same structure as `gh pr view --json comments` output)
+# Outputs: integer count (0 = no prior warning; >0 = already warned)
+already_warned_count() {
+    local comments_json="$1"
+    echo "$comments_json" | jq '[.comments[].body | select(contains("yanked on crates.io"))] | length'
+}
+
 # Return early if sourced for helper functions only (used by tests)
 [ "${RECONCILE_SOURCED:-}" = "1" ] && return 0
 
@@ -152,9 +161,8 @@ while IFS=' ' read -r PR_NUM BRANCH BODY_B64; do
             gh pr edit "$PR_NUM" --add-label "yanked-upstream" || true
 
             # Check whether we already posted a warning on this PR
-            ALREADY_WARNED=$(gh pr view "$PR_NUM" \
-                --json comments \
-                --jq '[.comments[].body | select(contains("yanked on crates.io"))] | length')
+            PR_COMMENTS_JSON=$(gh pr view "$PR_NUM" --json comments)
+            ALREADY_WARNED=$(already_warned_count "$PR_COMMENTS_JSON")
 
             if [ "${ALREADY_WARNED:-0}" -eq 0 ]; then
                 COMMENT_BODY="⚠️ **Upstream version \`${PR_VERSION}\` has been yanked on crates.io.**"

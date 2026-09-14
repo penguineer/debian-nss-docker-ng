@@ -70,6 +70,7 @@ git checkout -b "$BRANCH"
 # ── run prepare-update.sh ─────────────────────────────────────────────────────
 
 PREPARE_OUTPUT=$(bash "$PREPARE_SCRIPT" \
+    --repo-root "$(pwd)" \
     "$NEW_VERSION" \
     "$CRATE_URL" \
     "$CRATE_CHECKSUM")
