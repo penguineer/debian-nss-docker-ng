@@ -8,7 +8,14 @@
 #   - crates.io jq filter logic (yanked, pre-release, all-yanked)
 #   - duplicate PR detection logic
 #   - checksum verification logic
-#   - bash syntax of both scripts
+#   - bash syntax of check-upstream.sh, prepare-update.sh,
+#     reconcile-yanked-prs.sh, detect-existing-update-pr.sh,
+#     prepare-update-branch.sh, create-update-pr.sh
+#   - reconcile-yanked-prs.sh pure helpers (sourced via RECONCILE_SOURCED=1):
+#       * is_automation_owned: detects automation marker in PR body
+#       * extract_pr_version: extracts version from upstream-update/<version>
+#       * decide_yanked_action: maps yanked state to action string
+#       * duplicate-warning detection (ALREADY_WARNED logic)
 #   - prepare-update.sh integration (isolated to a fixture checkout):
 #       * upstream source files are updated
 #       * packaging-owned files are preserved
@@ -26,6 +33,10 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 CHECK_SCRIPT="$REPO_ROOT/ci/check-upstream.sh"
 PREPARE_SCRIPT="$REPO_ROOT/ci/prepare-update.sh"
+RECONCILE_SCRIPT="$REPO_ROOT/ci/reconcile-yanked-prs.sh"
+DETECT_SCRIPT="$REPO_ROOT/ci/detect-existing-update-pr.sh"
+PREPARE_BRANCH_SCRIPT="$REPO_ROOT/ci/prepare-update-branch.sh"
+CREATE_PR_SCRIPT="$REPO_ROOT/ci/create-update-pr.sh"
 PASS=0
 FAIL=0
 TMPDIR_BASE="$(mktemp -d /tmp/test-check-upstream.XXXXXX)"
@@ -45,6 +56,10 @@ fi
 # CHECK_UPSTREAM_SOURCED=1 suppresses the main execution path; only the
 # helper functions (semver_gt, is_prerelease, die) are imported.
 CHECK_UPSTREAM_SOURCED=1 . "$CHECK_SCRIPT"
+
+# ── Source pure helpers from reconcile-yanked-prs.sh ─────────────────────────
+# RECONCILE_SOURCED=1 suppresses the main execution path.
+RECONCILE_SOURCED=1 . "$RECONCILE_SCRIPT"
 
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
@@ -129,8 +144,66 @@ WRONG="0000000000000000000000000000000000000000000000000000000000000000"
 
 echo ""
 echo "--- Bash syntax ---"
-bash -n "$CHECK_SCRIPT"   && pass "check-upstream.sh syntax OK"  || fail "check-upstream.sh syntax error"
-bash -n "$PREPARE_SCRIPT" && pass "prepare-update.sh syntax OK"  || fail "prepare-update.sh syntax error"
+bash -n "$CHECK_SCRIPT"          && pass "check-upstream.sh syntax OK"          || fail "check-upstream.sh syntax error"
+bash -n "$PREPARE_SCRIPT"        && pass "prepare-update.sh syntax OK"          || fail "prepare-update.sh syntax error"
+bash -n "$RECONCILE_SCRIPT"      && pass "reconcile-yanked-prs.sh syntax OK"    || fail "reconcile-yanked-prs.sh syntax error"
+bash -n "$DETECT_SCRIPT"         && pass "detect-existing-update-pr.sh syntax OK" || fail "detect-existing-update-pr.sh syntax error"
+bash -n "$PREPARE_BRANCH_SCRIPT" && pass "prepare-update-branch.sh syntax OK"  || fail "prepare-update-branch.sh syntax error"
+bash -n "$CREATE_PR_SCRIPT"      && pass "create-update-pr.sh syntax OK"        || fail "create-update-pr.sh syntax error"
+
+# ══════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "=== reconcile-yanked-prs.sh unit tests (pure helpers) ==="
+echo ""
+
+echo "--- is_automation_owned ---"
+MARKER="This PR was created automatically by the upstream-release-check workflow."
+[ "$(is_automation_owned "$MARKER")" = "yes" ] \
+    && pass "body with marker -> yes" || fail "body with marker should be yes"
+[ "$(is_automation_owned "Some other body text")" = "no" ] \
+    && pass "body without marker -> no" || fail "body without marker should be no"
+[ "$(is_automation_owned "")" = "no" ] \
+    && pass "empty body -> no" || fail "empty body should be no"
+# Partial match must not count
+[ "$(is_automation_owned "created automatically by something else")" = "no" ] \
+    && pass "partial marker -> no" || fail "partial marker should be no"
+
+echo ""
+echo "--- extract_pr_version ---"
+[ "$(extract_pr_version "upstream-update/1.3.0")" = "1.3.0" ] \
+    && pass "extracts 1.3.0 from upstream-update/1.3.0" || fail "version extraction wrong"
+[ "$(extract_pr_version "upstream-update/2.0.1")" = "2.0.1" ] \
+    && pass "extracts 2.0.1" || fail "version extraction wrong for 2.0.1"
+[ -z "$(extract_pr_version "upstream-update/")" ] \
+    && pass "empty suffix -> empty string" || fail "empty suffix should yield empty"
+[ -z "$(extract_pr_version "other-branch/1.3.0")" ] \
+    && pass "non-matching prefix -> empty string" || fail "non-matching prefix should yield empty"
+
+echo ""
+echo "--- decide_yanked_action ---"
+[ "$(decide_yanked_action "true")" = "flag" ] \
+    && pass "yanked=true -> flag" || fail "yanked=true should give flag"
+[ "$(decide_yanked_action "false")" = "ok" ] \
+    && pass "yanked=false -> ok" || fail "yanked=false should give ok"
+[ "$(decide_yanked_action "unknown")" = "skip" ] \
+    && pass "yanked=unknown -> skip" || fail "yanked=unknown should give skip"
+[ "$(decide_yanked_action "")" = "skip" ] \
+    && pass "yanked=empty -> skip" || fail "yanked=empty should give skip"
+[ "$(decide_yanked_action "null")" = "skip" ] \
+    && pass "yanked=null -> skip" || fail "yanked=null should give skip"
+
+echo ""
+echo "--- duplicate-warning detection (already-warned logic) ---"
+# Simulate the ALREADY_WARNED check: comments containing the sentinel string
+WARN_SENTINEL="yanked on crates.io"
+COMMENT_WITH_WARN="⚠️ Upstream version 1.3.0 has been yanked on crates.io. ..."
+COMMENT_WITHOUT_WARN="Just a regular comment"
+ALREADY_WARNED=$(echo "$COMMENT_WITH_WARN" | grep -c "$WARN_SENTINEL" || true)
+[ "${ALREADY_WARNED:-0}" -gt 0 ] \
+    && pass "warning sentinel detected in matching comment" || fail "warning sentinel not detected"
+ALREADY_WARNED_NO=$(echo "$COMMENT_WITHOUT_WARN" | grep -c "$WARN_SENTINEL" || true)
+[ "${ALREADY_WARNED_NO:-0}" -eq 0 ] \
+    && pass "no false positive for unrelated comment" || fail "false positive in unrelated comment"
 
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
