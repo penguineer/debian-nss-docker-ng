@@ -91,9 +91,12 @@ jobs:
             bash /ci/check-package.sh /artifacts
 
       # ------------------------------------------------------------------ #
-      # 4. Install / removal lifecycle test                                 #
+      # 4. Install / reinstall / removal lifecycle test                     #
+      #    Exercises: install -> verify -> reinstall same .deb ->           #
+      #    verify idempotence (no duplicate docker_ng) -> remove ->         #
+      #    verify exact NSS restoration.                                    #
       # ------------------------------------------------------------------ #
-      - name: NSS lifecycle test (install + remove)
+      - name: NSS lifecycle test (install + reinstall + remove)
         run: |
           ARTIFACTS=$(dirname "${{ github.workspace }}")
           docker run --rm \

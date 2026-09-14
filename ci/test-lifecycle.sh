@@ -1,8 +1,11 @@
 #!/bin/bash
-# ci/test-lifecycle.sh — Install and remove the Debian package; verify NSS lifecycle.
+# ci/test-lifecycle.sh — Install, reinstall, and remove the Debian package; verify NSS lifecycle.
 #
 # Usage: test-lifecycle.sh <artifacts-dir>
 #   <artifacts-dir>  Directory containing the built .deb file.
+#
+# Lifecycle exercised:
+#   baseline -> install -> verify -> reinstall same .deb -> verify idempotence -> remove -> verify restoration
 #
 # Expected environment: Debian Trixie CI image (ci/Dockerfile).
 set -euo pipefail
@@ -12,39 +15,91 @@ ARTIFACTS_DIR="${1:?Usage: $0 <artifacts-dir>}"
 MULTIARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
 DEB=$(ls "$ARTIFACTS_DIR"/libnss-docker-ng_*.deb | head -1)
 
+# ---------------------------------------------------------------------------
+# Helper: verify the installed state of the package.
+# Checks library presence, NSS symbols, ldconfig cache, and that docker_ng
+# appears exactly once in the hosts: line.
+#
+# Usage: verify_installed_state <phase_label>
+# ---------------------------------------------------------------------------
+verify_installed_state() {
+    local phase="${1:?phase label required}"
+
+    echo ""
+    echo "=== [$phase] Verifying library is in multiarch path ==="
+    ls -la "/usr/lib/${MULTIARCH}/libnss_docker_ng.so"  || { echo "FAIL: .so missing"; exit 1; }
+    ls -la "/usr/lib/${MULTIARCH}/libnss_docker_ng.so.2" || { echo "FAIL: .so.2 missing"; exit 1; }
+
+    echo ""
+    echo "=== [$phase] Verifying NSS entry points in .so.2 ==="
+    nm -D "/usr/lib/${MULTIARCH}/libnss_docker_ng.so.2" \
+        | grep -E '_nss_docker_ng_(gethostbyname[24]?_r|gethostbyaddr_r)'
+
+    echo ""
+    echo "=== [$phase] Verifying library is loadable ==="
+    ldconfig
+    ldconfig -p | grep libnss_docker_ng || { echo "FAIL: library not in ldconfig cache"; exit 1; }
+
+    echo ""
+    echo "=== [$phase] Verifying docker_ng appears exactly once in hosts: ==="
+    local hosts_line
+    hosts_line=$(grep '^hosts:' /etc/nsswitch.conf)
+    local count
+    count=$(echo "$hosts_line" | tr ' ' '\n' | grep -c '^docker_ng$' || true)
+    if [ "$count" -ne 1 ]; then
+        echo "FAIL: docker_ng appears $count time(s) in hosts: line (expected 1)."
+        echo "  hosts: [$hosts_line]"
+        exit 1
+    fi
+    echo "$phase verification PASSED."
+}
+
 echo "=== Pre-install nsswitch.conf ==="
 PRE_NSS=$(grep '^hosts:' /etc/nsswitch.conf || true)
 echo "$PRE_NSS"
 
+# ---------------------------------------------------------------------------
+# Phase 1: Initial install
+# ---------------------------------------------------------------------------
 echo ""
 echo "=== Installing $DEB ==="
 dpkg -i "$DEB"
 
 echo ""
 echo "=== Post-install nsswitch.conf ==="
-grep '^hosts:' /etc/nsswitch.conf
+POST_INSTALL_NSS=$(grep '^hosts:' /etc/nsswitch.conf)
+echo "$POST_INSTALL_NSS"
+
+verify_installed_state "post-install"
+
+# ---------------------------------------------------------------------------
+# Phase 2: Reinstall the same .deb (idempotence / upgrade-path check)
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== Reinstalling $DEB (same-version reinstall) ==="
+dpkg -i "$DEB"
 
 echo ""
-echo "=== Verifying library is in multiarch path ==="
-ls -la "/usr/lib/${MULTIARCH}/libnss_docker_ng.so"  || { echo "FAIL: .so missing"; exit 1; }
-ls -la "/usr/lib/${MULTIARCH}/libnss_docker_ng.so.2" || { echo "FAIL: .so.2 missing"; exit 1; }
+echo "=== Post-reinstall nsswitch.conf ==="
+POST_REINSTALL_NSS=$(grep '^hosts:' /etc/nsswitch.conf)
+echo "$POST_REINSTALL_NSS"
+
+verify_installed_state "post-reinstall"
 
 echo ""
-echo "=== Verifying NSS entry points in .so.2 ==="
-nm -D "/usr/lib/${MULTIARCH}/libnss_docker_ng.so.2" \
-    | grep -E '_nss_docker_ng_(gethostbyname[24]?_r|gethostbyaddr_r)'
+echo "=== Verifying hosts: line is identical after reinstall ==="
+if [ "$POST_INSTALL_NSS" = "$POST_REINSTALL_NSS" ]; then
+    echo "NSS hosts: line unchanged by reinstall. PASSED."
+else
+    echo "FAIL: NSS hosts: line changed after reinstall."
+    echo "  Post-install:   [$POST_INSTALL_NSS]"
+    echo "  Post-reinstall: [$POST_REINSTALL_NSS]"
+    exit 1
+fi
 
-echo ""
-echo "=== Verifying library is loadable ==="
-ldconfig
-ldconfig -p | grep libnss_docker_ng || { echo "FAIL: library not in ldconfig cache"; exit 1; }
-
-echo ""
-echo "=== Verifying dh_installnss added docker_ng to hosts: ==="
-grep '^hosts:' /etc/nsswitch.conf | grep -q 'docker_ng' \
-    || { echo "FAIL: docker_ng not in hosts: line after install"; exit 1; }
-echo "Install verification PASSED."
-
+# ---------------------------------------------------------------------------
+# Phase 3: Remove and verify restoration
+# ---------------------------------------------------------------------------
 echo ""
 echo "=== Removing package ==="
 dpkg -r libnss-docker-ng
