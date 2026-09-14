@@ -6,14 +6,33 @@ for Debian as the `libnss-docker-ng` binary package.
 ## Repository contents
 
 - upstream source snapshot for `nss-docker-ng` 1.2.1
-- `vendor.tar.gz` generated with `cargo vendor`
+- `vendor.tar.gz` — offline Cargo build archive (`.cargo/config.toml` + `vendor/`)
 - Debian packaging in `debian/`
 - packaging notes in `docs/packaging-strategy.md`
+- upstream update process in `docs/upstream-updates.md`
+- release process in `docs/release-process.md`
+
+## CI
+
+Every push to `main` and every pull request runs the authoritative **Debian Package CI**
+on Debian Trixie:
+
+1. **Package build** — `dpkg-buildpackage` inside a Debian Trixie container; upstream
+   unit tests run during `dh_auto_test`.
+2. **Lintian / package-content checks** — lintian policy check plus explicit
+   verification of installed file layout.
+3. **Install + reinstall + removal lifecycle test** — installs the built `.deb`,
+   verifies `docker_ng` is inserted into `/etc/nsswitch.conf`, reinstalls the same
+   package and confirms no duplicate entry, removes the package and confirms exact
+   NSS restoration to the pre-install state.
+4. **Docker-backed `getent` smoke test** — installs the package and resolves a live
+   container name via `getent hosts <container>.docker` using the real Docker socket.
+
+All four stages must pass before a commit is considered valid.
 
 ## Building
 
-Install the Debian packaging helpers and Rust toolchain, then build the binary
-package:
+Inside a Debian Trixie environment, install the build dependencies and build:
 
 ```bash
 sudo apt-get install -y debhelper dh-nss cargo rustc
@@ -21,33 +40,35 @@ dpkg-buildpackage -us -uc -b
 ```
 
 The minimum supported Rust version is **1.85** (the version shipped with Debian
-Trixie). The package has been verified to build and pass its upstream test suite
-with `rustc 1.85.0`. A clean Debian Trixie build and Docker-backed `getent`
-test are tracked in issue #4.
-
-The `vendor.tar.gz` contains all 198 Rust crate dependencies pre-fetched with
-`cargo vendor`. No network access is required during the build.
+Trixie). The `vendor.tar.gz` contains 198 pre-fetched Rust crate dependencies;
+no network access is required during the build.
 
 ## Installing
 
-After a successful build, install the generated package from the parent
-directory:
+After a successful build, install the generated package:
 
 ```bash
 sudo apt install ../libnss-docker-ng_1.2.1-1_amd64.deb
 ```
 
-`dh_installnss` updates `/etc/nsswitch.conf` automatically so that `docker_ng`
-is added to the `hosts:` line.
+`dh_installnss` updates `/etc/nsswitch.conf` automatically on install and reverts
+the change automatically on removal.
 
 ## NSS configuration
 
-The package manages `/etc/nsswitch.conf` automatically. If you need to inspect
-the expected result, the relevant line looks like:
+The package ships `debian/libnss-docker-ng.nss` which declares the placement policy:
 
-```text
-hosts: files docker_ng dns resolve
 ```
+hosts before=dns,resolve docker_ng
+```
+
+`dh_installnss` reads this policy and inserts `docker_ng` before `dns` and `resolve`
+on the `hosts:` line of `/etc/nsswitch.conf` at install time, while preserving all
+other services already present on that line. On removal it removes `docker_ng` and
+restores the line to its exact pre-install state.
+
+The resulting `hosts:` line therefore depends on what was already configured on the
+system; it is not a fixed string.
 
 ## Usage
 
@@ -60,57 +81,50 @@ getent hosts my-container.docker
 
 ## Uninstalling
 
-Remove the package; `dh_installnss` removes the `docker_ng` entry from
-`/etc/nsswitch.conf` automatically during removal:
-
 ```bash
 sudo apt remove libnss-docker-ng
 ```
 
-To additionally purge any leftover package state:
+`dh_installnss` removes the `docker_ng` entry from `/etc/nsswitch.conf` and restores
+the original line automatically. To additionally purge any leftover package state:
 
 ```bash
 sudo apt purge libnss-docker-ng
 ```
 
-## Validation
-
-The following was verified on Ubuntu Noble (glibc 2.39) with `rustc 1.85.0`
-(matching Debian Trixie's compiler version):
-
-- Package builds successfully with `rustc 1.85.0`
-- Upstream unit tests (`cargo test --locked --offline`) pass during build
-- `dpkg -i` installs cleanly; `dh_installnss` inserts `docker_ng` into `/etc/nsswitch.conf`
-- glibc can `dlopen` `libnss_docker_ng.so.2`; NSS symbols
-  `_nss_docker_ng_gethostbyname2_r` and `_nss_docker_ng_gethostbyaddr_r` resolve
-- `apt remove` reverts `/etc/nsswitch.conf` to its pre-install state and removes all library files
-
-A clean Debian Trixie build environment and a live Docker-backed `getent` test
-are tracked in issue #4.
-
 ## Maintainer notes
 
-To refresh vendored dependencies for the packaged upstream release:
+### Upstream updates
 
-```bash
-mkdir -p work
-cd work
-curl -L -A cargo --fail \
-  https://static.crates.io/crates/nss-docker-ng/nss-docker-ng-1.2.1.crate \
-  -o nss-docker-ng-1.2.1.crate
-tar xzf nss-docker-ng-1.2.1.crate
-cd nss-docker-ng-1.2.1
-# Apply the Trixie compatibility patch before vendoring, so the vendored
-# crates match the Trixie-compatible dependency resolution in Cargo.lock
-patch -p1 < /path/to/debian/patches/0001-trixie-compat-msrv.patch
-mkdir -p .cargo
-cargo vendor > .cargo/config.toml
-tar -zcf ../../vendor.tar.gz .cargo/config.toml vendor/
-```
+New upstream releases are detected automatically by a scheduled workflow that queries
+crates.io every Monday. When a new stable, non-yanked release is found, the workflow:
 
-`Cargo.lock` is **not** included in `vendor.tar.gz`. The repository's
-`Cargo.lock` (with the Trixie compatibility patch applied) is the single
-authoritative lockfile used by `cargo --locked --offline` during the build.
+1. validates the release and verifies the crate checksum,
+2. prepares an `upstream-update/<version>` branch with updated sources, a regenerated
+   `vendor.tar.gz`, and a bumped `debian/changelog`,
+3. evaluates the Trixie/MSRV compatibility patch,
+4. runs the full package CI on the exact prepared commit, and
+5. opens a reviewable pull request (draft if patch review is required).
+
+No upstream update is merged or released automatically; human review is always required.
+
+See [`docs/upstream-updates.md`](docs/upstream-updates.md) for the full maintainer flow,
+including how to trigger the workflow manually and how to handle yanked releases.
+
+### Releasing
+
+Push a `debian/<version>` tag on a reviewed `main` commit. The release workflow
+validates version consistency, runs the full package CI, and publishes the exact
+validated artifacts to a GitHub Release.
+
+See [`docs/release-process.md`](docs/release-process.md) for the complete sequence.
+
+### Historical context
+
+Early validation was performed on Ubuntu Noble (glibc 2.39) with `rustc 1.85.0`,
+which matched Debian Trixie's compiler version at the time. Debian Trixie running
+inside a Docker container is now the authoritative CI environment for all build,
+lintian, lifecycle, and smoke-test validation.
 
 ## License
 
