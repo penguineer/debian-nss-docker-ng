@@ -14,6 +14,18 @@ Treat this repository as low-level system infrastructure. NSS integration, packa
 * Do not silently weaken existing validation, reproducibility, security, or review boundaries to simplify an implementation.
 * Optimize for code and automation that another maintainer can understand without reconstructing project history.
 
+Current architectural decisions described below are defaults and invariants for ordinary changes.
+
+An assigned issue may deliberately change one of those decisions, but only when that change is explicit in scope. In that case:
+
+* treat the architecture change itself as part of the issue, not as incidental implementation cleanup
+* review the implications across Debian packaging, CI, security, reproducibility, update automation, release automation, and documentation
+* preserve or improve the relevant guarantees of the existing design
+* update tests and documentation so the repository consistently describes the replacement architecture
+* do not leave old assumptions or comments behind after the change
+
+Strong requirements below should therefore prevent accidental architectural drift, not block an explicitly reviewed architecture change.
+
 ## Repository structure and readability
 
 Keep GitHub Actions workflows primarily as orchestration.
@@ -88,7 +100,7 @@ Do not:
 
 External upstream source used for updates must be versioned and checksum-verified before repository changes are prepared.
 
-Package builds must continue to use the committed vendored dependencies and locked/offline Cargo build process.
+Package builds must continue to use the committed vendored dependencies and locked/offline Cargo build process unless an assigned issue explicitly changes that packaging strategy under the architecture-change rules above.
 
 ## Docker socket usage
 
@@ -122,7 +134,7 @@ Do not assume that install/remove coverage is sufficient for an issue involving 
 
 ## NSS integration
 
-`dh_installnss` and the package `.nss` file are the authoritative mechanism for `/etc/nsswitch.conf` integration.
+`dh_installnss` and the package `.nss` file are the authoritative mechanism for `/etc/nsswitch.conf` integration unless an assigned issue explicitly changes that integration strategy under the architecture-change rules above.
 
 Do not hard-code or replace the user's complete `hosts:` line.
 
@@ -247,6 +259,7 @@ Check all of the following:
 
    * Does it still follow established repository conventions?
    * Is non-trivial workflow logic externalized appropriately?
+   * If the issue intentionally changes an architectural invariant, have all dependent assumptions, tests, CI, and documentation been updated consistently?
 
 3. **Security**
 
