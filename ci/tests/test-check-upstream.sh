@@ -8,7 +8,26 @@
 #   - crates.io jq filter logic (yanked, pre-release, all-yanked)
 #   - duplicate PR detection logic
 #   - checksum verification logic
-#   - bash syntax of both scripts
+#   - bash syntax of check-upstream.sh, prepare-update.sh,
+#     reconcile-yanked-prs.sh, detect-existing-update-pr.sh,
+#     prepare-update-branch.sh, create-update-pr.sh
+#   - reconcile-yanked-prs.sh pure helpers (sourced via RECONCILE_SOURCED=1):
+#       * is_automation_owned: detects automation marker in PR body
+#       * extract_pr_version: extracts version from upstream-update/<version>
+#       * decide_yanked_action: maps yanked state to action string
+#       * already_warned_count: counts prior yanked-warning comments via jq
+#   - detect-existing-update-pr.sh (fake gh):
+#       * matching PR -> skip=true
+#       * no matching PR -> skip=false
+#   - create-update-pr.sh (fake gh):
+#       * non-draft PR omits --draft flag
+#       * draft PR passes --draft flag
+#       * automation ownership marker present in PR body
+#       * DRAFT note present in draft PR body
+#   - prepare-update-branch.sh integration (isolated fixture, SKIP_PUSH=true):
+#       * all expected GITHUB_OUTPUT keys emitted
+#       * branch name follows upstream-update/<version> convention
+#       * commit_sha is a full 40-char hex SHA
 #   - prepare-update.sh integration (isolated to a fixture checkout):
 #       * upstream source files are updated
 #       * packaging-owned files are preserved
@@ -26,6 +45,10 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 CHECK_SCRIPT="$REPO_ROOT/ci/check-upstream.sh"
 PREPARE_SCRIPT="$REPO_ROOT/ci/prepare-update.sh"
+RECONCILE_SCRIPT="$REPO_ROOT/ci/reconcile-yanked-prs.sh"
+DETECT_SCRIPT="$REPO_ROOT/ci/detect-existing-update-pr.sh"
+PREPARE_BRANCH_SCRIPT="$REPO_ROOT/ci/prepare-update-branch.sh"
+CREATE_PR_SCRIPT="$REPO_ROOT/ci/create-update-pr.sh"
 PASS=0
 FAIL=0
 TMPDIR_BASE="$(mktemp -d /tmp/test-check-upstream.XXXXXX)"
@@ -45,6 +68,10 @@ fi
 # CHECK_UPSTREAM_SOURCED=1 suppresses the main execution path; only the
 # helper functions (semver_gt, is_prerelease, die) are imported.
 CHECK_UPSTREAM_SOURCED=1 . "$CHECK_SCRIPT"
+
+# ── Source pure helpers from reconcile-yanked-prs.sh ─────────────────────────
+# RECONCILE_SOURCED=1 suppresses the main execution path.
+RECONCILE_SOURCED=1 . "$RECONCILE_SCRIPT"
 
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
@@ -112,10 +139,56 @@ NULL_RESULT=$(echo "$ALL_YANKED" | jq -r '
     && pass "all-yanked returns null/empty" || fail "all-yanked: got $NULL_RESULT"
 
 echo ""
-echo "--- Duplicate PR detection ---"
-TITLE="chore: update nss-docker-ng to 1.3.0"
-echo "$TITLE" | grep -qF "1.3.0" && pass "duplicate PR detected for 1.3.0"  || fail "missed duplicate"
-! echo "$TITLE" | grep -qF "1.4.0" && pass "no false positive for 1.4.0"   || fail "false positive"
+echo "--- detect-existing-update-pr.sh (fake gh) ---"
+# Build a fake gh binary that simulates gh pr list output.
+FAKE_GH_DIR="${TMPDIR_BASE}/fake-gh-detect"
+mkdir -p "$FAKE_GH_DIR"
+
+# Fake gh returns one matching PR when searching for 1.3.0
+cat > "$FAKE_GH_DIR/gh" << 'FAKE_GH'
+#!/bin/bash
+# Minimal fake gh for detect-existing-update-pr.sh tests.
+# Called as: gh pr list --state open --search "nss-docker-ng VERSION in:title" --json ... --jq ...
+SEARCH_ARG=""
+JQ_ARG=""
+for i in "$@"; do
+    case "$PREV" in
+        --search) SEARCH_ARG="$i" ;;
+        --jq)     JQ_ARG="$i" ;;
+    esac
+    PREV="$i"
+done
+if echo "$SEARCH_ARG" | grep -q "1.3.0"; then
+    # Return a matching PR number
+    echo '[{"number":42,"title":"chore: update nss-docker-ng to 1.3.0"}]' \
+        | jq -r "$JQ_ARG"
+else
+    # Return empty array so jq '.[0].number // empty' evaluates to empty
+    echo '[]' | jq -r "$JQ_ARG"
+fi
+FAKE_GH
+chmod +x "$FAKE_GH_DIR/gh"
+
+DETECT_OUTPUT_1="${TMPDIR_BASE}/detect-output-1.txt"
+: > "$DETECT_OUTPUT_1"
+NEW_VERSION="1.3.0" GITHUB_OUTPUT="$DETECT_OUTPUT_1" \
+    PATH="$FAKE_GH_DIR:$PATH" \
+    bash "$DETECT_SCRIPT"
+SKIP_1=$(grep '^skip=' "$DETECT_OUTPUT_1" | cut -d= -f2)
+[ "$SKIP_1" = "true" ] \
+    && pass "detect-existing-update-pr.sh: matching PR -> skip=true" \
+    || fail "detect-existing-update-pr.sh: matching PR should give skip=true (got '$SKIP_1')"
+
+# Fake gh returns no matching PR when searching for 1.4.0
+DETECT_OUTPUT_2="${TMPDIR_BASE}/detect-output-2.txt"
+: > "$DETECT_OUTPUT_2"
+NEW_VERSION="1.4.0" GITHUB_OUTPUT="$DETECT_OUTPUT_2" \
+    PATH="$FAKE_GH_DIR:$PATH" \
+    bash "$DETECT_SCRIPT"
+SKIP_2=$(grep '^skip=' "$DETECT_OUTPUT_2" | cut -d= -f2)
+[ "$SKIP_2" = "false" ] \
+    && pass "detect-existing-update-pr.sh: no matching PR -> skip=false" \
+    || fail "detect-existing-update-pr.sh: no matching PR should give skip=false (got '$SKIP_2')"
 
 echo ""
 echo "--- Checksum verification logic ---"
@@ -129,8 +202,156 @@ WRONG="0000000000000000000000000000000000000000000000000000000000000000"
 
 echo ""
 echo "--- Bash syntax ---"
-bash -n "$CHECK_SCRIPT"   && pass "check-upstream.sh syntax OK"  || fail "check-upstream.sh syntax error"
-bash -n "$PREPARE_SCRIPT" && pass "prepare-update.sh syntax OK"  || fail "prepare-update.sh syntax error"
+bash -n "$CHECK_SCRIPT"          && pass "check-upstream.sh syntax OK"          || fail "check-upstream.sh syntax error"
+bash -n "$PREPARE_SCRIPT"        && pass "prepare-update.sh syntax OK"          || fail "prepare-update.sh syntax error"
+bash -n "$RECONCILE_SCRIPT"      && pass "reconcile-yanked-prs.sh syntax OK"    || fail "reconcile-yanked-prs.sh syntax error"
+bash -n "$DETECT_SCRIPT"         && pass "detect-existing-update-pr.sh syntax OK" || fail "detect-existing-update-pr.sh syntax error"
+bash -n "$PREPARE_BRANCH_SCRIPT" && pass "prepare-update-branch.sh syntax OK"  || fail "prepare-update-branch.sh syntax error"
+bash -n "$CREATE_PR_SCRIPT"      && pass "create-update-pr.sh syntax OK"        || fail "create-update-pr.sh syntax error"
+
+# ══════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "=== reconcile-yanked-prs.sh unit tests (pure helpers) ==="
+echo ""
+
+echo "--- is_automation_owned ---"
+MARKER="This PR was created automatically by the upstream-release-check workflow."
+[ "$(is_automation_owned "$MARKER")" = "yes" ] \
+    && pass "body with marker -> yes" || fail "body with marker should be yes"
+[ "$(is_automation_owned "Some other body text")" = "no" ] \
+    && pass "body without marker -> no" || fail "body without marker should be no"
+[ "$(is_automation_owned "")" = "no" ] \
+    && pass "empty body -> no" || fail "empty body should be no"
+# Partial match must not count
+[ "$(is_automation_owned "created automatically by something else")" = "no" ] \
+    && pass "partial marker -> no" || fail "partial marker should be no"
+
+echo ""
+echo "--- extract_pr_version ---"
+[ "$(extract_pr_version "upstream-update/1.3.0")" = "1.3.0" ] \
+    && pass "extracts 1.3.0 from upstream-update/1.3.0" || fail "version extraction wrong"
+[ "$(extract_pr_version "upstream-update/2.0.1")" = "2.0.1" ] \
+    && pass "extracts 2.0.1" || fail "version extraction wrong for 2.0.1"
+[ -z "$(extract_pr_version "upstream-update/")" ] \
+    && pass "empty suffix -> empty string" || fail "empty suffix should yield empty"
+[ -z "$(extract_pr_version "other-branch/1.3.0")" ] \
+    && pass "non-matching prefix -> empty string" || fail "non-matching prefix should yield empty"
+
+echo ""
+echo "--- decide_yanked_action ---"
+[ "$(decide_yanked_action "true")" = "flag" ] \
+    && pass "yanked=true -> flag" || fail "yanked=true should give flag"
+[ "$(decide_yanked_action "false")" = "ok" ] \
+    && pass "yanked=false -> ok" || fail "yanked=false should give ok"
+[ "$(decide_yanked_action "unknown")" = "skip" ] \
+    && pass "yanked=unknown -> skip" || fail "yanked=unknown should give skip"
+[ "$(decide_yanked_action "")" = "skip" ] \
+    && pass "yanked=empty -> skip" || fail "yanked=empty should give skip"
+[ "$(decide_yanked_action "null")" = "skip" ] \
+    && pass "yanked=null -> skip" || fail "yanked=null should give skip"
+
+echo ""
+echo "--- duplicate-warning detection (already_warned_count production helper) ---"
+# already_warned_count accepts the JSON structure from `gh pr view --json comments`
+# and returns the count of comments containing "yanked on crates.io".
+COMMENTS_WITH_WARN='{"comments":[{"body":"⚠️ Upstream version 1.3.0 has been yanked on crates.io."}]}'
+COMMENTS_WITHOUT_WARN='{"comments":[{"body":"Just a regular review comment"}]}'
+COMMENTS_EMPTY='{"comments":[]}'
+
+COUNT_1=$(already_warned_count "$COMMENTS_WITH_WARN")
+[ "${COUNT_1:-0}" -gt 0 ] \
+    && pass "already_warned_count: detects yanked warning in comments" \
+    || fail "already_warned_count: should detect yanked warning (got $COUNT_1)"
+
+COUNT_2=$(already_warned_count "$COMMENTS_WITHOUT_WARN")
+[ "${COUNT_2:-0}" -eq 0 ] \
+    && pass "already_warned_count: no false positive for unrelated comment" \
+    || fail "already_warned_count: false positive (got $COUNT_2)"
+
+COUNT_3=$(already_warned_count "$COMMENTS_EMPTY")
+[ "${COUNT_3:-0}" -eq 0 ] \
+    && pass "already_warned_count: empty comments -> 0" \
+    || fail "already_warned_count: empty comments should give 0 (got $COUNT_3)"
+
+# ══════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "=== create-update-pr.sh unit tests (fake gh) ==="
+echo ""
+
+# Build a fake gh that records the arguments it is invoked with.
+FAKE_GH_PR_DIR="${TMPDIR_BASE}/fake-gh-pr"
+mkdir -p "$FAKE_GH_PR_DIR"
+cat > "$FAKE_GH_PR_DIR/gh" << 'FAKE_GH_PR'
+#!/bin/bash
+# Records all arguments to a file so tests can inspect them.
+echo "$@" >> "${FAKE_GH_CALLS_FILE:?FAKE_GH_CALLS_FILE must be set}"
+FAKE_GH_PR
+chmod +x "$FAKE_GH_PR_DIR/gh"
+
+echo "--- create-update-pr.sh: non-draft PR ---"
+CALLS_FILE_NODRAFT="${TMPDIR_BASE}/gh-calls-nodraft.txt"
+: > "$CALLS_FILE_NODRAFT"
+FAKE_GH_CALLS_FILE="$CALLS_FILE_NODRAFT" \
+NEW_VERSION="1.3.0" \
+CURRENT_VERSION="1.2.1" \
+BRANCH="upstream-update/1.3.0" \
+COMMIT_SHA="abc1234" \
+DRAFT_PR="false" \
+CRATE_URL="https://example.com/crate.tar.gz" \
+CRATE_CHECKSUM="deadbeef" \
+CARGO_TOML_CHANGED="false" \
+CARGO_LOCK_CHANGED="false" \
+PATCH_STATUS="applied" \
+GH_TOKEN="fake" \
+    PATH="$FAKE_GH_PR_DIR:$PATH" \
+    bash "$CREATE_PR_SCRIPT"
+
+# Verify --draft flag is absent in a non-draft invocation
+if grep -q -- '--draft' "$CALLS_FILE_NODRAFT" 2>/dev/null; then
+    fail "create-update-pr.sh: non-draft PR should not pass --draft to gh"
+else
+    pass "create-update-pr.sh: non-draft PR omits --draft flag"
+fi
+
+# Verify the automation marker is in the --body argument
+# (gh is called with --body <body> so the body content appears in the args)
+if grep -qF 'This PR was created automatically by the upstream-release-check workflow.' "$CALLS_FILE_NODRAFT"; then
+    pass "create-update-pr.sh: automation marker present in PR body"
+else
+    fail "create-update-pr.sh: automation marker missing from PR body"
+fi
+
+echo ""
+echo "--- create-update-pr.sh: draft PR ---"
+CALLS_FILE_DRAFT="${TMPDIR_BASE}/gh-calls-draft.txt"
+: > "$CALLS_FILE_DRAFT"
+FAKE_GH_CALLS_FILE="$CALLS_FILE_DRAFT" \
+NEW_VERSION="1.3.0" \
+CURRENT_VERSION="1.2.1" \
+BRANCH="upstream-update/1.3.0" \
+COMMIT_SHA="abc1234" \
+DRAFT_PR="true" \
+CRATE_URL="https://example.com/crate.tar.gz" \
+CRATE_CHECKSUM="deadbeef" \
+CARGO_TOML_CHANGED="true" \
+CARGO_LOCK_CHANGED="true" \
+PATCH_STATUS="needs-review" \
+GH_TOKEN="fake" \
+    PATH="$FAKE_GH_PR_DIR:$PATH" \
+    bash "$CREATE_PR_SCRIPT"
+
+if grep -q -- '--draft' "$CALLS_FILE_DRAFT" 2>/dev/null; then
+    pass "create-update-pr.sh: draft PR passes --draft to gh"
+else
+    fail "create-update-pr.sh: draft PR should pass --draft to gh"
+fi
+
+# Verify the DRAFT note is in the body
+if grep -qF 'DRAFT:' "$CALLS_FILE_DRAFT"; then
+    pass "create-update-pr.sh: draft note present in draft PR body"
+else
+    fail "create-update-pr.sh: draft note missing from draft PR body"
+fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
@@ -211,6 +432,103 @@ run_prepare() {
     DEBEMAIL="test@test" DEBFULLNAME="Test" \
         bash "$PREPARE_SCRIPT" --repo-root "$repo" "$@"
 }
+
+# ── prepare-update-branch.sh: GITHUB_OUTPUT emission and commit ───────────────
+echo ""
+echo "=== prepare-update-branch.sh integration tests ==="
+echo ""
+echo "--- prepare-update-branch.sh: GITHUB_OUTPUT emission and commit ---"
+
+BRANCH_REPO="${TMPDIR_BASE}/branch-repo"
+make_test_repo "$BRANCH_REPO"
+
+BRANCH_OUTPUT_FILE="${TMPDIR_BASE}/branch-github-output.txt"
+: > "$BRANCH_OUTPUT_FILE"
+
+BRANCH_FAKE_VERSION="88.0.0"
+BRANCH_FAKE_UPSTREAM="${TMPDIR_BASE}/branch-fake-crate/nss-docker-ng-${BRANCH_FAKE_VERSION}"
+mkdir -p "$BRANCH_FAKE_UPSTREAM/src"
+cat > "$BRANCH_FAKE_UPSTREAM/Cargo.toml" << 'CARGO_BRANCH_EOF'
+[package]
+name = "nss-docker-ng"
+version = "88.0.0"
+edition = "2021"
+license = "MIT"
+[lib]
+name = "nss_docker_ng"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+CARGO_BRANCH_EOF
+cat > "$BRANCH_FAKE_UPSTREAM/Cargo.lock" << 'LOCK_BRANCH_EOF'
+# This file is automatically @generated by Cargo.
+version = 3
+
+[[package]]
+name = "nss-docker-ng"
+version = "88.0.0"
+LOCK_BRANCH_EOF
+echo "// FAKE v88" > "$BRANCH_FAKE_UPSTREAM/src/lib.rs"
+echo "FAKE LICENSE v88" > "$BRANCH_FAKE_UPSTREAM/LICENSE"
+
+BRANCH_FAKE_ARCHIVE="${TMPDIR_BASE}/nss-docker-ng-${BRANCH_FAKE_VERSION}.tar.gz"
+tar -czf "$BRANCH_FAKE_ARCHIVE" \
+    -C "${TMPDIR_BASE}/branch-fake-crate" \
+    "nss-docker-ng-${BRANCH_FAKE_VERSION}"
+BRANCH_FAKE_CHECKSUM=$(sha256sum "$BRANCH_FAKE_ARCHIVE" | awk '{print $1}')
+
+# Capture real-checkout state before running the integration test.
+# If prepare-update-branch.sh ever regresses its repo-root isolation,
+# these will differ after the subshell completes and the test will fail.
+REAL_CHECKOUT_CARGO_BEFORE=$(sha256sum "$REPO_ROOT/Cargo.toml" | awk '{print $1}')
+REAL_CHECKOUT_SRC_BEFORE=$(sha256sum "$REPO_ROOT/src/lib.rs" | awk '{print $1}')
+
+BRANCH_EXIT=0
+(
+    cd "$BRANCH_REPO"
+    NEW_VERSION="$BRANCH_FAKE_VERSION" \
+    CRATE_URL="file://$BRANCH_FAKE_ARCHIVE" \
+    CRATE_CHECKSUM="$BRANCH_FAKE_CHECKSUM" \
+    GITHUB_OUTPUT="$BRANCH_OUTPUT_FILE" \
+    SKIP_PUSH="true" \
+    DEBEMAIL="test@test" DEBFULLNAME="Test" \
+        bash "$PREPARE_BRANCH_SCRIPT"
+) || BRANCH_EXIT=$?
+
+if [ "$BRANCH_EXIT" -ne 0 ]; then
+    fail "prepare-update-branch.sh: exited non-zero ($BRANCH_EXIT)"
+else
+    pass "prepare-update-branch.sh: exited 0"
+fi
+
+# Verify required GITHUB_OUTPUT keys are present
+for KEY in branch commit_sha draft_pr cargo_toml_changed cargo_lock_changed patch_status; do
+    if grep -q "^${KEY}=" "$BRANCH_OUTPUT_FILE"; then
+        pass "prepare-update-branch.sh: GITHUB_OUTPUT contains ${KEY}"
+    else
+        fail "prepare-update-branch.sh: GITHUB_OUTPUT missing ${KEY}"
+    fi
+done
+
+# Verify branch name matches expected naming convention
+EMITTED_BRANCH=$(grep '^branch=' "$BRANCH_OUTPUT_FILE" | cut -d= -f2)
+[ "$EMITTED_BRANCH" = "upstream-update/${BRANCH_FAKE_VERSION}" ] \
+    && pass "prepare-update-branch.sh: branch name is upstream-update/${BRANCH_FAKE_VERSION}" \
+    || fail "prepare-update-branch.sh: wrong branch name (got '$EMITTED_BRANCH')"
+
+# Verify commit_sha matches the actual prepared commit in the fixture repo
+EMITTED_SHA=$(grep '^commit_sha=' "$BRANCH_OUTPUT_FILE" | cut -d= -f2)
+EXPECTED_SHA=$(git -C "$BRANCH_REPO" rev-parse HEAD)
+[ "$EMITTED_SHA" = "$EXPECTED_SHA" ] \
+    && pass "prepare-update-branch.sh: commit_sha matches prepared fixture HEAD" \
+    || fail "prepare-update-branch.sh: emitted commit_sha does not match fixture HEAD (got '$EMITTED_SHA', expected '$EXPECTED_SHA')"
+
+# Verify real checkout was not touched by the integration test
+[ "$(sha256sum "$REPO_ROOT/Cargo.toml" | awk '{print $1}')" = "$REAL_CHECKOUT_CARGO_BEFORE" ] \
+    && pass "prepare-update-branch.sh: real-repo Cargo.toml unchanged (isolation)" \
+    || fail "prepare-update-branch.sh: real-repo Cargo.toml was modified (repo-root isolation regression)"
+[ "$(sha256sum "$REPO_ROOT/src/lib.rs" | awk '{print $1}')" = "$REAL_CHECKOUT_SRC_BEFORE" ] \
+    && pass "prepare-update-branch.sh: real-repo src/lib.rs unchanged (isolation)" \
+    || fail "prepare-update-branch.sh: real-repo src/lib.rs was modified (repo-root isolation regression)"
 
 # ── Test: checksum failure aborts before any modification ─────────────────────
 echo "--- Checksum failure aborts before modification ---"
