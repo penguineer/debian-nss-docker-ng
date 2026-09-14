@@ -17,14 +17,15 @@ on:
         default: ""
 
 permissions:
-  contents: write
-  pull-requests: write
-  issues: write
+  contents: read
 
 jobs:
   check:
     name: Check crates.io for new nss-docker-ng release
     runs-on: ubuntu-latest
+    # Read-only: only queries crates.io and reads repository state.
+    permissions:
+      contents: read
 
     outputs:
       update_available: ${{ steps.check.outputs.update_available }}
@@ -79,10 +80,33 @@ jobs:
           done <<< "$OUTPUT"
 
       - name: Log result
+        env:
+          CURRENT_VERSION: ${{ steps.check.outputs.current_version }}
+          UPSTREAM_VERSION: ${{ steps.check.outputs.upstream_version }}
+          UPDATE_AVAILABLE: ${{ steps.check.outputs.update_available }}
         run: |
-          echo "Current version:  ${{ steps.check.outputs.current_version }}"
-          echo "Upstream version: ${{ steps.check.outputs.upstream_version }}"
-          echo "Update available: ${{ steps.check.outputs.update_available }}"
+          echo "Current version:  $CURRENT_VERSION"
+          echo "Upstream version: $UPSTREAM_VERSION"
+          echo "Update available: $UPDATE_AVAILABLE"
+
+  reconcile:
+    name: Reconcile yanked upstream-update PRs
+    needs: check
+    runs-on: ubuntu-latest
+    # issues: write — required to post PR conversation comments (gh pr comment
+    # creates issue comments) and to create/add labels via gh label create and
+    # gh pr edit --add-label.  Pull-request listing/viewing needs only read access.
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Make scripts executable
+        run: chmod +x ci/reconcile-yanked-prs.sh
 
       - name: Reconcile open upstream-update PRs against crates.io yanked state
         # For each open automation-created upstream-update/X.Y.Z PR, verify that
@@ -97,6 +121,14 @@ jobs:
     needs: check
     if: needs.check.outputs.update_available == 'true'
     runs-on: ubuntu-latest
+    # contents: write — to push the upstream-update/<version> branch.
+    # pull-requests: write — to open the draft update PR.
+    # issues: write — required by GitHub's permission model for gh pr create
+    # to set labels on the newly-created pull request.
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
 
     outputs:
       branch: ${{ steps.prepare.outputs.branch }}
